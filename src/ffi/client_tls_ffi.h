@@ -75,6 +75,13 @@ struct FizzClientConnection : public folly::AsyncTransportWrapper::ReadCallback 
     std::shared_ptr<fizz::extensions::DelegatedCredentialClientExtension> dcExtension;
     std::string caCertPath; // Needed to create verifier during handshake
 
+    /// Out-of-band expectations from [`VerificationInfo`] (copied from context at connect).
+    std::string expectedServiceName;
+    uint32_t expectedValidTime{0};
+    uint16_t expectedVerifyScheme{0};
+    std::string expectedPublicKeyDerHex;
+    uint64_t expectedExpiresAt{0};
+
     // Pending read data (owned by C++ to avoid Rust buffer lifetime issues)
     std::vector<uint8_t> pending_read_data;
     std::recursive_mutex read_mutex;
