@@ -7,6 +7,7 @@
 #define GLOG_USE_GLOG_EXPORT
 
 #include "ffi/client_tls_ffi.h"
+#include "ffi/util.h"
 #include "fizz_rs/src/bridge.rs.h"
 #include <fizz/client/AsyncFizzClient.h>
 #include <fizz/client/PskSerializationUtils.h>
@@ -27,7 +28,6 @@
 #include <mutex>
 #include <stdexcept>
 #include <chrono>
-#include <cstdio>
 #include <thread>
 
 // Helper: Load CA certificate from file
@@ -84,31 +84,14 @@ static std::shared_ptr<fizz::DefaultCertificateVerifier> createCertificateVerifi
     }
 }
 
-/// Hex-encode wire delegated-credential public key (same layout as `credentials_ffi.cpp`).
-static std::string delegatedCredentialPublicKeyHex(
-    const fizz::extensions::DelegatedCredential& dc) {
-    auto pkData = dc.public_key->coalesce();
-    std::string out;
-    out.reserve(pkData.size() * 2);
-    for (size_t i = 0; i < pkData.size(); ++i) {
-        char buf[3];
-        std::snprintf(
-            buf,
-            sizeof(buf),
-            "%02x",
-            static_cast<unsigned char>(pkData[i]));
-        out += buf;
-    }
-    return out;
-}
-
 /// Returns empty string on success, otherwise a human-readable error.
 static std::string verifyVerificationInfoAgainstPeerDelegatedCredential(
     const FizzClientConnection& conn,
     const fizz::extensions::PeerDelegatedCredential& peerDC) {
     const auto& dc = peerDC.getDelegatedCredential();
 
-    if (delegatedCredentialPublicKeyHex(dc) != conn.expectedPublicKeyDerHex) {
+    if (bytes_to_hex_lower(dc.public_key->coalesce()) !=
+        conn.expectedPublicKeyDerHex) {
         return "delegated credential public key does not match VerificationInfo";
     }
     if (dc.valid_time != conn.expectedValidTime) {

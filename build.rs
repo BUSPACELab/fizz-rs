@@ -139,6 +139,7 @@ fn build_bridge(fizz_dependencies: &Vec<String>) {
     cxx.warnings(false)
         // Add C++ FFI implementation files
         .file("src/ffi/certificates_ffi.cpp")
+        .file("src/ffi/util.cpp")
         .file("src/ffi/credentials_ffi.cpp")
         .file("src/ffi/server_tls_ffi.cpp")
         .file("src/ffi/client_tls_ffi.cpp")
@@ -227,6 +228,8 @@ fn main() {
     // Rerun build script if any of these files change
     println!("cargo:rerun-if-changed=src/bridge.rs");
     println!("cargo:rerun-if-changed=src/ffi/certificates_ffi.cpp");
+    println!("cargo:rerun-if-changed=src/ffi/util.cpp");
+    println!("cargo:rerun-if-changed=src/ffi/util.h");
     println!("cargo:rerun-if-changed=src/ffi/credentials_ffi.cpp");
     println!("cargo:rerun-if-changed=src/ffi/server_tls_ffi.cpp");
     println!("cargo:rerun-if-changed=src/ffi/client_tls_ffi.cpp");
