@@ -220,6 +220,9 @@ pub mod ffi {
 
         fn server_read_size_hint(conn: Pin<&mut FizzServerConnection>) -> Result<usize>;
 
+        /// True after the peer has closed the TLS stream (`readEOF`); no more app data will arrive.
+        fn server_connection_read_eof(conn: &FizzServerConnection) -> bool;
+
         /// Write data to connection
         fn server_connection_write(
             conn: Pin<&mut FizzServerConnection>,
@@ -272,6 +275,9 @@ pub mod ffi {
         ) -> Result<usize>;
 
         fn client_read_size_hint(conn: Pin<&mut FizzClientConnection>) -> Result<usize>;
+
+        fn client_connection_read_eof(conn: &FizzClientConnection) -> bool;
+
         /// Write data to connection
         fn client_connection_write(
             conn: Pin<&mut FizzClientConnection>,
@@ -322,7 +328,7 @@ where
 }
 
 
-use std::{fmt::Formatter, marker::PhantomData};
+use std::marker::PhantomData;
 // Re-export types for use in other modules
 pub use ffi::{CertificateData, CertificatePublic, DelegatedCredential, ServiceCredential, VerificationInfo};
-use serde::{de::Visitor, ser::SerializeStruct, Deserialize, Deserializer};
+use serde::{de::Visitor, Deserialize, Deserializer};

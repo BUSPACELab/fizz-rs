@@ -18,6 +18,7 @@
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/AsyncSocket.h>
 #include <folly/io/IOBufQueue.h>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -62,6 +63,8 @@ struct FizzServerConnection : public folly::AsyncTransportWrapper::ReadCallback 
     // Read buffer queue for proper buffer management
     folly::IOBufQueue readBufQueue_{folly::IOBufQueue::cacheChainLength()};
     std::atomic<size_t> bytesRead;
+    /// Set when `readEOF()` is invoked (peer closed / no more application data).
+    std::atomic<bool> readEof{false};
 };
 
 // Include function declarations (uses forward-declared rust:: types)

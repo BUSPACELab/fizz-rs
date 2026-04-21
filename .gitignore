@@ -1,5 +1,9 @@
 /third_party/fizz-install
-*.key
 *.crt
+*.key
+# Committed test fixtures (delegated-TLS integration tests)
+!tests/fixtures/
+!tests/fixtures/*.crt
+!tests/fixtures/*.key
 /target/
 .idea/

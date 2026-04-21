@@ -3,18 +3,14 @@
 //! This module provides APIs for creating TLS server contexts configured with
 //! delegated credentials and accepting TLS connections.
 
-use crate::error::{Result, FizzError};
+use crate::bridge::ffi;
 use crate::certificates::CertificatePublic;
 use crate::credentials::DelegatedCredentialData;
-use crate::bridge::ffi;
+use crate::error::{FizzError, Result};
 use crate::io::{take_raw_fd, SendableRawPtr};
-use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpStream};
-use bytes::Buf;
-use std::io::Read;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use bytes::{BufMut, BytesMut};
+use tokio::net::{TcpListener, TcpStream};
 
 /// TLS server context configured with delegated credentials
 pub struct ServerTlsContext {
@@ -55,10 +51,7 @@ impl ServerTlsContext {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn new(cert: CertificatePublic, delegated_cred: DelegatedCredentialData) -> Result<Self> {
-        let inner = ffi::new_server_tls_context(
-            cert.as_inner(),
-            &delegated_cred.inner,
-        )?;
+        let inner = ffi::new_server_tls_context(cert.as_inner(), &delegated_cred.inner)?;
         Ok(Self { inner })
     }
 
@@ -100,8 +93,7 @@ impl ServerTlsContext {
     /// ```
     pub async fn accept(&self, listener: &TcpListener) -> Result<ServerConnection> {
         // Accept TCP connection
-        let (socket, _addr) = listener.accept().await
-            .map_err(|e| FizzError::IoError(e))?;
+        let (socket, _addr) = listener.accept().await.map_err(|e| FizzError::IoError(e))?;
 
         // Accept TLS connection from the socket
         self.accept_from_stream(socket).await
@@ -123,32 +115,36 @@ impl ServerTlsContext {
 
         // Get raw pointer to context and wrap in Send-able wrapper
         let ctx_sendable = unsafe {
-            SendableRawPtr::new(&self.inner as *const _ as *mut cxx::UniquePtr<ffi::FizzServerContext>)
+            SendableRawPtr::new(
+                &self.inner as *const _ as *mut cxx::UniquePtr<ffi::FizzServerContext>,
+            )
         };
 
         // Create FFI connection in blocking task
         // We return a raw pointer to avoid Send issues with CXX types
-        let conn_sendable = tokio::task::spawn_blocking(move || -> Result<SendableRawPtr<cxx::UniquePtr<ffi::FizzServerConnection>>> {
-            // Safety: We have exclusive access to context during this call
-            // The context is only read, not modified
-            let ctx = unsafe { &*ctx_sendable.as_ptr() };
-            let conn = ffi::server_accept_connection(ctx, fd)?;
-            // Box the connection and return sendable raw pointer
-            Ok(unsafe { SendableRawPtr::new(Box::into_raw(Box::new(conn))) })
-        })
+        let conn_sendable = tokio::task::spawn_blocking(
+            move || -> Result<SendableRawPtr<cxx::UniquePtr<ffi::FizzServerConnection>>> {
+                // Safety: We have exclusive access to context during this call
+                // The context is only read, not modified
+                let ctx = unsafe { &*ctx_sendable.as_ptr() };
+                let conn = ffi::server_accept_connection(ctx, fd)?;
+                // Box the connection and return sendable raw pointer
+                Ok(unsafe { SendableRawPtr::new(Box::into_raw(Box::new(conn))) })
+            },
+        )
         .await
-        .map_err(|e| FizzError::IoError(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to spawn blocking task: {}", e)
-        )))??;
+        .map_err(|e| {
+            FizzError::IoError(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to spawn blocking task: {}", e),
+            ))
+        })??;
 
         // Re-box the connection pointer first
         let mut conn_inner_box = unsafe { Box::from_raw(conn_sendable.as_ptr()) };
 
         // Perform async handshake using oneshot channel
-        ffi::server_connection_handshake(
-            conn_inner_box.pin_mut(),
-        )?;
+        ffi::server_connection_handshake(conn_inner_box.pin_mut())?;
 
         // Convert Box back to raw pointer to avoid holding non-Send Box across await
         // SAFETY: We immediately convert back to Box after the await
@@ -157,10 +153,8 @@ impl ServerTlsContext {
         // Convert back to Box after await
         let conn_inner_box = unsafe { Box::from_raw(conn_raw.as_ptr()) };
 
-        // Create connection with empty buffer
         Ok(ServerConnection {
             inner: *conn_inner_box,
-            read_buf: BytesMut::with_capacity(8192),
         })
     }
 }
@@ -172,8 +166,6 @@ impl ServerTlsContext {
 /// seamless integration with Tokio.
 pub struct ServerConnection {
     inner: cxx::UniquePtr<ffi::FizzServerConnection>,
-    /// Buffer for storing read data from C++
-    read_buf: BytesMut,
 }
 
 impl std::fmt::Debug for ServerConnection {
@@ -212,21 +204,18 @@ impl tokio::io::AsyncRead for ServerConnection {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-
-
         let conn_pin = self.inner.pin_mut();
         let read_size = match ffi::server_read_size_hint(conn_pin) {
             Ok(n) => n,
             Err(e) => {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e
-                )));
+                return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
             }
-
         };
 
         if read_size == 0 {
+            if ffi::server_connection_read_eof(&self.inner) {
+                return Poll::Ready(Ok(()));
+            }
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
@@ -237,7 +226,7 @@ impl tokio::io::AsyncRead for ServerConnection {
         // }
         //
 
-        let mut buf_slice = buf.initialize_unfilled();
+        let buf_slice = buf.initialize_unfilled();
 
         //Take the initialized_buffer, write into it, advance it.
         //SAFETY: We KNOW length of read_slice is at least as big as the size we are about to read.
@@ -249,18 +238,18 @@ impl tokio::io::AsyncRead for ServerConnection {
         // let buf_len = chunk.len();
         // let mut buf_slice = unsafe { std::slice::from_raw_parts_mut(buf_ptr, buf_len) };
 
-
         let read = match ffi::server_connection_read(self.inner.pin_mut(), buf_slice) {
             Ok(n) => n,
             Err(e) => {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e
-                )));
+                return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
             }
         };
 
         if read == 0 {
+            // This lets us distinguish between EOF and no data available.
+            if ffi::server_connection_read_eof(&self.inner) {
+                return Poll::Ready(Ok(()));
+            }
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
@@ -281,14 +270,13 @@ impl tokio::io::AsyncWrite for ServerConnection {
         //     return Poll::Ready(Ok(0));
         // }
 
-
         match ffi::server_connection_write(self.inner.pin_mut(), &buf) {
             Ok(n) => Poll::Ready(Ok(n)),
-            Err(e) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+            Err(e) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e))),
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
         // match ffi::server_connection_write(self.inner.pin_mut(), &[]) {
         //     Ok(_) => Poll::Ready(Ok(())),

@@ -7,12 +7,14 @@
 #define GLOG_USE_GLOG_EXPORT
 
 #include "ffi/client_tls_ffi.h"
+#include "ffi/util.h"
 #include "fizz_rs/src/bridge.rs.h"
 #include <fizz/client/AsyncFizzClient.h>
 #include <fizz/client/PskSerializationUtils.h>
 #include <fizz/extensions/delegatedcred/DelegatedCredentialClientExtension.h>
 #include <fizz/extensions/delegatedcred/DelegatedCredentialFactory.h>
 #include <fizz/extensions/delegatedcred/DelegatedCredentialUtils.h>
+#include <fizz/extensions/delegatedcred/PeerDelegatedCredential.h>
 #include <fizz/protocol/DefaultCertificateVerifier.h>
 #include <folly/io/async/AsyncSocket.h>
 #include <folly/io/async/EventBaseManager.h>
@@ -82,6 +84,37 @@ static std::shared_ptr<fizz::DefaultCertificateVerifier> createCertificateVerifi
     }
 }
 
+/// Returns empty string on success, otherwise a human-readable error.
+static std::string verifyVerificationInfoAgainstPeerDelegatedCredential(
+    const FizzClientConnection& conn,
+    const fizz::extensions::PeerDelegatedCredential& peerDC) {
+    const auto& dc = peerDC.getDelegatedCredential();
+
+    if (bytes_to_hex_lower(dc.public_key->coalesce()) !=
+        conn.expectedPublicKeyDerHex) {
+        return "delegated credential public key does not match VerificationInfo";
+    }
+    if (dc.valid_time != conn.expectedValidTime) {
+        return "delegated credential valid_time does not match VerificationInfo";
+    }
+    if (static_cast<uint16_t>(dc.expected_verify_scheme) != conn.expectedVerifyScheme) {
+        return "delegated credential verify scheme does not match VerificationInfo";
+    }
+
+    folly::ssl::X509UniquePtr leafX509 = peerDC.getX509();
+    auto expTp = fizz::extensions::DelegatedCredentialUtils::getCredentialExpiresTime(
+        leafX509, dc);
+    const uint64_t wireExpiresSec = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(expTp.time_since_epoch())
+            .count());
+    if (wireExpiresSec != conn.expectedExpiresAt) {
+        return "delegated credential expiry does not match VerificationInfo";
+    }
+
+    (void)conn.expectedServiceName;
+    return {};
+}
+
 // ============================================================================
 // FizzClientConnection Destructor
 // ============================================================================
@@ -130,6 +163,7 @@ void FizzClientConnection::readDataAvailable(size_t len) noexcept {
 }
 
 void FizzClientConnection::readEOF() noexcept {
+    readEof.store(true, std::memory_order_release);
     auto* transport_ = static_cast<fizz::client::AsyncFizzClient*>(transport);
     // std::cout << "Server closed connection" << std::endl;
     transport_->closeNow();
@@ -271,6 +305,12 @@ std::unique_ptr<FizzClientConnection> client_connect(
             dcSigSchemes);
         conn->bytesRead = 0;
 
+        conn->expectedServiceName = ctx.serviceName;
+        conn->expectedValidTime = ctx.validTime;
+        conn->expectedVerifyScheme = ctx.expectedVerifyScheme;
+        conn->expectedPublicKeyDerHex = ctx.publicKeyDer;
+        conn->expectedExpiresAt = ctx.expiresAt;
+
         // Create AsyncSocket from file descriptor
         // Note: AsyncSocket takes ownership of the FD
         folly::NetworkSocket networkSocket(fd);
@@ -339,19 +379,34 @@ void client_connection_handshake(FizzClientConnection& conn) {
 
             void fizzHandshakeSuccess(fizz::client::AsyncFizzClient* client) noexcept override {
                 try {
-                    // Extract peer certificate after successful handshake
                     const auto& state = client->getState();
-                    if (state.serverCert()) {
-                        // TODO: Implement proper PEM conversion from serverCert()
-                        // For now, just mark as complete
-                        peerCert_ = "[Certificate extracted successfully]";
+                    auto serverCert = state.serverCert();
+                    if (!serverCert) {
+                        error_ = "No server certificate after handshake";
+                        return;
                     }
 
-                    // std::cout << "Client handshake successful!" << std::endl;
+                    const auto* peerDC =
+                        dynamic_cast<const fizz::extensions::PeerDelegatedCredential*>(
+                            serverCert.get());
+                    if (!peerDC) {
+                        error_ = "Server did not present a delegated credential certificate";
+                        return;
+                    }
+
+                    std::string mismatch =
+                        verifyVerificationInfoAgainstPeerDelegatedCredential(*conn_, *peerDC);
+                    if (!mismatch.empty()) {
+                        error_ = std::move(mismatch);
+                        client->closeNow();
+                        return;
+                    }
+
+                    peerCert_ = "[Certificate extracted successfully]";
                     client->setReadCB(conn_);
                     complete_ = true;
                 } catch (const std::exception& e) {
-                    error_ = std::string("Failed to extract peer certificate: ") + e.what();
+                    error_ = std::string("Failed to verify delegated credential: ") + e.what();
                 }
             }
 
@@ -514,6 +569,10 @@ size_t client_connection_read(
 
 size_t client_read_size_hint(FizzClientConnection& conn) {
     return conn.bytesRead;
+}
+
+bool client_connection_read_eof(const FizzClientConnection& conn) {
+    return conn.readEof.load(std::memory_order_acquire);
 }
 
 size_t client_connection_write(

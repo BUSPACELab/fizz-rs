@@ -1,0 +1,11 @@
+--- a/build/fbcode_builder/manifests/fizz
++++ b/build/fbcode_builder/manifests/fizz
+@@ -5,6 +5,8 @@ shipit_fbcode_builder = true
+ 
+ [git]
+ repo_url = https://github.com/facebookincubator/fizz.git
++# Pin to the same commit as third_party/fizz submodule so getdeps does not fetch main (API skew vs folly-rev.txt).
++rev = 034e4d3d3150bf1e245590cbc1e2988cca66eecd
+ 
+ [build]
+ builder = cmake

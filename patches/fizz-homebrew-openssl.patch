@@ -1,0 +1,16 @@
+--- a/build/fbcode_builder/getdeps/buildopts.py
++++ b/build/fbcode_builder/getdeps/buildopts.py
+@@ -291,8 +291,11 @@
+             for p in brew_packages:
+                 found = self.add_homebrew_package_to_env(p, env)
+                 # Try extra hard to find openssl, needed with homebrew on macOS
+                 if found and p.startswith("openssl"):
+-                    candidate = homebrew_package_prefix("openssl@1.1")
+-                    if os.path.exists(candidate):
++                    # openssl@1.1 removed from Homebrew on many macOS setups; use @3 first.
++                    candidate = homebrew_package_prefix("openssl@3")
++                    if candidate is None:
++                        candidate = homebrew_package_prefix("openssl@1.1")
++                    if candidate and os.path.exists(candidate):
+                         os.environ["OPENSSL_ROOT_DIR"] = candidate
+                         env["OPENSSL_ROOT_DIR"] = os.environ["OPENSSL_ROOT_DIR"]

@@ -7,7 +7,6 @@ use crate::bridge::ffi;
 use crate::error::{FizzError, Result};
 use crate::io::{take_raw_fd, SendableRawPtr};
 use crate::types::VerificationInfo;
-use bytes::{BufMut, BytesMut};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::net::TcpStream;
@@ -145,10 +144,8 @@ impl ClientTlsContext {
         // Convert back to Box after await
         let conn_inner_box = unsafe { Box::from_raw(conn_raw.as_ptr()) };
 
-        // Create connection with empty buffer
         Ok(ClientConnection {
             inner: *conn_inner_box,
-            read_buf: BytesMut::with_capacity(8192),
         })
     }
 }
@@ -160,8 +157,6 @@ impl ClientTlsContext {
 /// seamless integration with Tokio.
 pub struct ClientConnection {
     inner: cxx::UniquePtr<ffi::FizzClientConnection>,
-    /// Buffer for storing read data from C++
-    read_buf: BytesMut,
 }
 
 impl std::fmt::Debug for ClientConnection {
@@ -227,8 +222,10 @@ impl tokio::io::AsyncRead for ClientConnection {
             }
         };
 
-
         if read_size == 0 {
+            if ffi::client_connection_read_eof(&self.inner) {
+                return Poll::Ready(Ok(()));
+            }
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
@@ -238,7 +235,6 @@ impl tokio::io::AsyncRead for ClientConnection {
         let mut buf_slice = buf.initialize_unfilled();
 
         // println!("We will try to read into a buffer of size {}", buf_slice.len());
-
 
         let conn_pin = self.inner.pin_mut();
         let read = match ffi::client_connection_read(conn_pin, &mut buf_slice) {
@@ -251,6 +247,10 @@ impl tokio::io::AsyncRead for ClientConnection {
         // println!("On poll_read, we have read {} ", read);
 
         if read == 0 {
+            // This lets us distinguish between EOF and no data available.
+            if ffi::client_connection_read_eof(&self.inner) {
+                return Poll::Ready(Ok(()));
+            }
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
@@ -278,7 +278,7 @@ impl tokio::io::AsyncWrite for ClientConnection {
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         // Perform a flush by writing empty data - this ensures C++ buffers are flushed
         // We use the same synchronous pattern as poll_write
         Poll::Ready(Ok(()))

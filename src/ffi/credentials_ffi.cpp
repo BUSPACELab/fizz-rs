@@ -8,6 +8,7 @@
 
 #include "ffi/credentials_ffi.h"
 #include "ffi/certificates_ffi.h"
+#include "ffi/util.h"
 #include "fizz_rs/src/bridge.rs.h"
 #include <fizz/protocol/Certificate.h>
 #include <fizz/backend/openssl/certificate/OpenSSLSelfCertImpl.h>
@@ -237,20 +238,10 @@ ServiceCredential generate_delegated_credential(
 
         // Serialize credential fields
         auto pkData = credential2.public_key->coalesce();
-        std::string pkHex;
-        for (size_t i = 0; i < pkData.size(); ++i) {
-            char buf[3];
-            snprintf(buf, sizeof(buf), "%02x", static_cast<unsigned char>(pkData[i]));
-            pkHex += buf;
-        }
+        std::string pkHex = bytes_to_hex_lower(pkData);
 
         auto sigData = credential2.signature->coalesce();
-        std::string sigHex;
-        for (size_t i = 0; i < sigData.size(); ++i) {
-            char buf[3];
-            snprintf(buf, sizeof(buf), "%02x", static_cast<unsigned char>(sigData[i]));
-            sigHex += buf;
-        }
+        std::string sigHex = bytes_to_hex_lower(sigData);
 
         // Build ServiceCredential
         ServiceCredential result;

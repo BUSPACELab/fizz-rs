@@ -1,5 +1,7 @@
 # Fizz-rs
 
+[![build](https://github.com/BUSPACELab/fizz-rs-dev/actions/workflows/ci.yml/badge.svg)](https://github.com/BUSPACELab/fizz-rs-dev/actions/workflows/ci.yml)
+
 Rust FFI bindings for delegated credentials (DC) TLS with Fizz.
 
 ## Certificate and Keys

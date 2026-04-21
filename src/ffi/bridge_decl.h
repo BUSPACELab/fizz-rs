@@ -87,6 +87,7 @@ size_t server_connection_read(
     FizzServerConnection& conn,
     rust::Slice<uint8_t> buf);
 size_t server_read_size_hint(FizzServerConnection& conn);
+bool server_connection_read_eof(const FizzServerConnection& conn);
 size_t server_connection_write(
     FizzServerConnection& conn,
     rust::Slice<const uint8_t> buf);
@@ -112,6 +113,7 @@ size_t client_connection_read(
     FizzClientConnection& conn,
     rust::Slice<uint8_t> buf);
 size_t client_read_size_hint(FizzClientConnection& conn);
+bool client_connection_read_eof(const FizzClientConnection& conn);
 size_t client_connection_write(
     FizzClientConnection& conn,
     rust::Slice<const uint8_t> buf);

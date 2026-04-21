@@ -17,5 +17,15 @@ serde = { version = "1.0.0", features = ["derive"] }
 [build-dependencies]
 cxx-build = "=1.0.176"
 
+# Do not use `features = ["full"]` here: Cargo unions dev-dependency features with
+# [dependencies], so `full` forces a maximal Tokio build for every `cargo test` / CI run.
 [dev-dependencies]
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
