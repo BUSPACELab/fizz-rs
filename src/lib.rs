@@ -40,7 +40,9 @@ pub use cxx::{UniquePtr, SharedPtr};
 // FFI declares stubs (e.g. `load_delegated_credential_from_pem`) not wired from Rust yet.
 #[allow(dead_code)]
 mod bridge;
-// pub mod async_context;
+pub mod async_context;
+pub mod cpp_bench;
+pub mod read_waker;
 pub mod error;
 pub mod types;
 pub mod certificates;

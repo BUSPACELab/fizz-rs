@@ -7,3 +7,5 @@
 !tests/fixtures/*.key
 /target/
 .idea/
+# uv-managed virtual environments (created by `uv run --project`)
+.venv/

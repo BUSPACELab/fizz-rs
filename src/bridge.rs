@@ -3,8 +3,8 @@
 //! This module defines the FFI boundary between Rust and C++ using the CXX framework.
 //! All shared types, opaque types, and FFI functions are declared here.
 
-// Re-export async context items for use in bridge
-// use crate::async_context::{IoContext, handle_io_result};
+pub use crate::async_context::{IoContext, handle_io_result};
+pub use crate::read_waker::{ReadWaker, wake_read_waker};
 
 #[cxx::bridge]
 pub mod ffi {
@@ -81,16 +81,31 @@ pub mod ffi {
         pub sig_schemes: Vec<u16>,
     }
 
+    /// Outcome of a coalesced poll-read FFI call. Avoids 2-3 cxx round-trips
+    /// (size_hint + read_eof + read) per `poll_read`.
+    #[derive(Debug, Clone, Copy)]
+    pub struct ReadOutcome {
+        /// Number of bytes actually copied into the caller's buffer.
+        pub bytes_read: u64,
+        /// True iff the peer has closed and no more data will arrive.
+        pub eof: bool,
+    }
+
     // ============================================================================
     // Rust Types Exposed to C++ (Async Contexts)
     // ============================================================================
 
-    // extern "Rust" {
-    //     type IoContext;
-    //
-    //     /// Callback invoked by C++ when async I/O operation completes
-    //     fn handle_io_result(context: Box<IoContext>, bytes: usize, error: String);
-    // }
+    extern "Rust" {
+        type IoContext;
+
+        fn handle_io_result(context: Box<IoContext>, bytes: usize, error: String);
+
+        /// Opaque Rust `Waker` slot. `poll_read` registers a `Waker` into it;
+        /// C++ read callbacks call `wake_read_waker` to fire it.
+        type ReadWaker;
+
+        fn wake_read_waker(waker: &ReadWaker);
+    }
 
     // ============================================================================
     // Opaque C++ Types
@@ -223,6 +238,14 @@ pub mod ffi {
         /// True after the peer has closed the TLS stream (`readEOF`); no more app data will arrive.
         fn server_connection_read_eof(conn: &FizzServerConnection) -> bool;
 
+        /// Coalesced read: take the read mutex once, return both bytes_read
+        /// and eof in a single FFI round-trip. Replaces the size_hint + read +
+        /// read_eof sequence that `poll_read` used to perform.
+        fn server_connection_read_or_status(
+            conn: Pin<&mut FizzServerConnection>,
+            buf: &mut [u8],
+        ) -> Result<ReadOutcome>;
+
         /// Write data to connection
         fn server_connection_write(
             conn: Pin<&mut FizzServerConnection>,
@@ -278,6 +301,12 @@ pub mod ffi {
 
         fn client_connection_read_eof(conn: &FizzClientConnection) -> bool;
 
+        /// Coalesced read — see `server_connection_read_or_status`.
+        fn client_connection_read_or_status(
+            conn: Pin<&mut FizzClientConnection>,
+            buf: &mut [u8],
+        ) -> Result<ReadOutcome>;
+
         /// Write data to connection
         fn client_connection_write(
             conn: Pin<&mut FizzClientConnection>,
@@ -286,6 +315,45 @@ pub mod ffi {
 
         /// Get peer certificate as PEM string
         fn client_connection_peer_cert(conn: &FizzClientConnection) -> Result<String>;
+
+        // ========================================================================
+        // Async Handshake FFI (oneshot-channel based, no spin-wait)
+        // ========================================================================
+
+        fn server_connection_handshake_async(
+            conn: Pin<&mut FizzServerConnection>,
+            context: Box<IoContext>,
+        ) -> Result<()>;
+
+        fn client_connection_handshake_async(
+            conn: Pin<&mut FizzClientConnection>,
+            context: Box<IoContext>,
+        ) -> Result<()>;
+
+        /// Install a read-side `Waker` slot on the server connection. The C++
+        /// side fires it when new application data arrives or EOF is observed.
+        fn set_server_read_waker(
+            conn: Pin<&mut FizzServerConnection>,
+            waker: Box<ReadWaker>,
+        );
+
+        /// Install a read-side `Waker` slot on the client connection. The C++
+        /// side fires it when new application data arrives or EOF is observed.
+        fn set_client_read_waker(
+            conn: Pin<&mut FizzClientConnection>,
+            waker: Box<ReadWaker>,
+        );
+
+        /// Pure-C++ fizz+folly echo benchmark — see `src/ffi/cpp_bench.h`.
+        /// Returns wall time in microseconds. Bypasses Tokio entirely; the only
+        /// FFI crossings are this call and its return.
+        fn run_fizz_cpp_bench(
+            server_ctx: &FizzServerContext,
+            client_ctx: &FizzClientContext,
+            pairs: u64,
+            batch_size: u64,
+            rounds: u64,
+        ) -> Result<u64>;
     }
 }
 

@@ -1,0 +1,11 @@
+[project]
+name = "fizz-rs-benchmarking"
+version = "0.1.0"
+description = "Plotting scripts for the fizz_rs / tls_bench_ablation scaling benchmark"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib>=3.7",
+]
+
+[tool.uv]
+package = false

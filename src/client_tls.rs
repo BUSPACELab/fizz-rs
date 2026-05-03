@@ -6,8 +6,10 @@
 use crate::bridge::ffi;
 use crate::error::{FizzError, Result};
 use crate::io::{take_raw_fd, SendableRawPtr};
+use crate::read_waker::ReadWaker;
 use crate::types::VerificationInfo;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::net::TcpStream;
 
@@ -29,6 +31,11 @@ unsafe impl Send for ClientTlsContext {}
 unsafe impl Sync for ClientTlsContext {}
 
 impl ClientTlsContext {
+    /// Crate-internal accessor for the CXX context. Used by `fizz_rs::cpp_bench`.
+    pub(crate) fn cxx_ref(&self) -> &ffi::FizzClientContext {
+        &*self.inner
+    }
+
     /// Create a new client TLS context
     ///
     /// # Arguments
@@ -100,26 +107,19 @@ impl ClientTlsContext {
     /// # }
     /// ```
     pub async fn connect(&self, socket: TcpStream, hostname: &str) -> Result<ClientConnection> {
-        // Extract FD (this transfers ownership)
         let fd = take_raw_fd(socket);
         let hostname_string = hostname.to_string();
 
-        // Get raw pointer to context and wrap in Send-able wrapper
         let ctx_sendable = unsafe {
             SendableRawPtr::new(
                 &self.inner as *const _ as *mut cxx::UniquePtr<ffi::FizzClientContext>,
             )
         };
 
-        // Create FFI connection in blocking task
-        // We return a raw pointer to avoid Send issues with CXX types
         let conn_sendable = tokio::task::spawn_blocking(
             move || -> Result<SendableRawPtr<cxx::UniquePtr<ffi::FizzClientConnection>>> {
-                // Safety: We have exclusive access to context during this call
-                // The context is only read, not modified
                 let ctx = unsafe { &*ctx_sendable.as_ptr() };
                 let conn = ffi::client_connect(ctx, fd, &hostname_string)?;
-                // Box the connection and return sendable raw pointer
                 Ok(unsafe { SendableRawPtr::new(Box::into_raw(Box::new(conn))) })
             },
         )
@@ -131,21 +131,36 @@ impl ClientTlsContext {
             ))
         })??;
 
-        // Re-box the connection pointer first
         let mut conn_inner_box = unsafe { Box::from_raw(conn_sendable.as_ptr()) };
 
-        // Perform async handshake using oneshot channel
-        ffi::client_connection_handshake(conn_inner_box.pin_mut())?;
+        let (io_ctx, receiver) = crate::async_context::IoContext::new();
 
-        // Convert Box back to raw pointer to avoid holding non-Send Box across await
-        // SAFETY: We immediately convert back to Box after the await
+        ffi::client_connection_handshake_async(conn_inner_box.pin_mut(), Box::new(io_ctx))
+            .map_err(|e| FizzError::TlsHandshakeError(e.to_string()))?;
+
+        // SAFETY: raw-pointer dance keeps the CXX UniquePtr alive across the
+        // await point without requiring it to be Send.
         let conn_raw = unsafe { SendableRawPtr::new(Box::into_raw(conn_inner_box)) };
 
-        // Convert back to Box after await
-        let conn_inner_box = unsafe { Box::from_raw(conn_raw.as_ptr()) };
+        let result = receiver.await.map_err(|_| {
+            FizzError::TlsHandshakeError(
+                "Handshake channel closed unexpectedly".to_string(),
+            )
+        })?;
+
+        result.map_err(|e| FizzError::TlsHandshakeError(e))?;
+
+        let mut conn_inner_box = unsafe { Box::from_raw(conn_raw.as_ptr()) };
+
+        let read_waker = Arc::new(ReadWaker::new());
+        ffi::set_client_read_waker(
+            conn_inner_box.pin_mut(),
+            Box::new(read_waker.clone_for_cpp()),
+        );
 
         Ok(ClientConnection {
             inner: *conn_inner_box,
+            read_waker,
         })
     }
 }
@@ -157,6 +172,7 @@ impl ClientTlsContext {
 /// seamless integration with Tokio.
 pub struct ClientConnection {
     inner: cxx::UniquePtr<ffi::FizzClientConnection>,
+    read_waker: Arc<ReadWaker>,
 }
 
 impl std::fmt::Debug for ClientConnection {
@@ -193,14 +209,12 @@ impl ClientConnection {
     ///
     /// This gracefully closes the TLS connection and cleans up resources.
     pub fn close(&mut self) {
-        println!("Closing connection");
         ffi::client_connection_close(self.inner.pin_mut());
     }
 }
 
 impl Drop for ClientConnection {
     fn drop(&mut self) {
-        println!("Cleaning up Client connection");
         self.close();
     }
 }
@@ -212,56 +226,29 @@ impl tokio::io::AsyncRead for ClientConnection {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let read_size = {
-            let conn_pin = self.inner.pin_mut();
-            match ffi::client_read_size_hint(conn_pin) {
-                Ok(n) => n,
-                Err(e) => {
-                    return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
-                }
-            }
-        };
+        // Register before inspecting state — any wake that races with our check
+        // will still hit the registered waker and cause us to be re-polled.
+        self.read_waker.register(cx.waker());
 
-        if read_size == 0 {
-            if ffi::client_connection_read_eof(&self.inner) {
-                return Poll::Ready(Ok(()));
-            }
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
+        let buf_slice = buf.initialize_unfilled();
 
-        // println!("On poll_read, we have {} available to read from size_hint", read_size);
-
-        let mut buf_slice = buf.initialize_unfilled();
-
-        // println!("We will try to read into a buffer of size {}", buf_slice.len());
-
-        let conn_pin = self.inner.pin_mut();
-        let read = match ffi::client_connection_read(conn_pin, &mut buf_slice) {
-            Ok(n) => n,
+        let outcome = match ffi::client_connection_read_or_status(self.inner.pin_mut(), buf_slice) {
+            Ok(o) => o,
             Err(e) => {
                 return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
             }
         };
 
-        // println!("On poll_read, we have read {} ", read);
-
-        if read == 0 {
-            // This lets us distinguish between EOF and no data available.
-            if ffi::client_connection_read_eof(&self.inner) {
-                return Poll::Ready(Ok(()));
-            }
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
+        if outcome.bytes_read > 0 {
+            buf.advance(outcome.bytes_read as usize);
+            return Poll::Ready(Ok(()));
         }
-        //
-        // unsafe { self.read_buf.advance_mut(read) };
-        // //THis copies the buffer... Is there a way to
-        // buf.put_slice(&buf_slice[..read]);
-        // let _ = self.read_buf.split_to(read);
 
-        buf.advance(read);
-        Poll::Ready(Ok(()))
+        if outcome.eof {
+            return Poll::Ready(Ok(()));
+        }
+
+        Poll::Pending
     }
 }
 

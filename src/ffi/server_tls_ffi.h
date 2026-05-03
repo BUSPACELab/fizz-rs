@@ -23,11 +23,14 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <optional>
+#include <rust/cxx.h>
 
 // Forward declare shared structs from bridge
 struct CertificateData;
 struct CertificatePublic;
 struct ServiceCredential;
+struct ReadWaker;
 
 // Opaque type for server TLS context
 // Full definition is required for CXX UniquePtr operations
@@ -57,14 +60,30 @@ struct FizzServerConnection : public folly::AsyncTransportWrapper::ReadCallback 
 
     // Pending read data (owned by C++ to avoid Rust buffer lifetime issues)
     std::vector<uint8_t> pending_read_data;
-    std::recursive_mutex read_mutex;
-    std::atomic<size_t> pending_read_lock_numbers;
+    // Serializes the evb thread's getReadBuffer/readDataAvailable callbacks
+    // against the Tokio worker's `*_connection_read_or_status` calls. The lock
+    // is held by the evb thread from `getReadBuffer` (preallocate into the
+    // queue) until `readDataAvailable` (postallocate commits). Released also
+    // by `readEOF` / `readErr` if a getReadBuffer was outstanding.
+    std::mutex read_mutex;
+    bool pending_read{false};
 
     // Read buffer queue for proper buffer management
     folly::IOBufQueue readBufQueue_{folly::IOBufQueue::cacheChainLength()};
     std::atomic<size_t> bytesRead;
     /// Set when `readEOF()` is invoked (peer closed / no more application data).
     std::atomic<bool> readEof{false};
+
+    /// Rust-owned waker slot. Fired from `readDataAvailable` / `readEOF` so
+    /// that the Rust `poll_read` task can wake without spin-polling.
+    std::optional<rust::Box<ReadWaker>> read_waker;
+
+    /// Set by the async write-completion callback on `writeErr`. Checked at
+    /// the top of `server_connection_write` on the next call so the error
+    /// propagates to Rust even though dispatch is fire-and-forget.
+    std::atomic<bool> writeError{false};
+    std::mutex writeErrorMutex;
+    std::string writeErrorMessage;
 };
 
 // Include function declarations (uses forward-declared rust:: types)

@@ -83,8 +83,8 @@ impl From<cxx::Exception> for FizzError {
                 return FizzError::DelegatedCredentialVerificationFailed(msg);
             }
             if msg.contains("timeout") || msg.contains("timed out") {
-                // Try to extract timeout value if present
-                return FizzError::HandshakeTimeout(5000); // default 5s
+                // Preserve C++ wording (includes actual duration); avoid a wrong fixed ms value.
+                return FizzError::TlsHandshakeError(msg);
             }
             if msg.contains("alert") {
                 // TLS alert received

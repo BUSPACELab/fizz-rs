@@ -1,3 +1,12 @@
+[workspace]
+members = [".", "crates/tls_bench_ablation"]
+resolver = "2"
+
+# Keep line-level debug info in release builds so profilers (samply, instruments,
+# cargo-flamegraph) produce readable frames. Minor binary-size cost; no perf cost.
+[profile.release]
+debug = 1
+
 [package]
 name = "fizz_rs"
 version = "0.1.0"

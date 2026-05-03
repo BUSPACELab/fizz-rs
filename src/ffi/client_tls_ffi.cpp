@@ -121,7 +121,6 @@ static std::string verifyVerificationInfoAgainstPeerDelegatedCredential(
 
 FizzClientConnection::~FizzClientConnection() {
     try {
-      std::cout << "Invoking client destructor" << std::endl;
         // Stop EventBase thread if it's running
             if (evb_thread && evb_thread->joinable()) {
                 if (evb) {
@@ -137,41 +136,44 @@ FizzClientConnection::~FizzClientConnection() {
 
 
 void FizzClientConnection::getReadBuffer(void** bufReturn, size_t* lenReturn) {
-  // Preallocate buffer in the queue - min 4096 bytes
-  //
-
-  // std::cout << "Client_side: About to acquire the lock" << std::endl;
-  read_mutex.lock();
-  pending_read_lock_numbers += 1;
-  // std::cout << "Client_side: Acquired the lock" << std::endl;
-  auto result = readBufQueue_.preallocate(40960, 65536);
-  *bufReturn = result.first;
-  *lenReturn = result.second;
+    // Held until the matched readDataAvailable / readEOF / readErr fires.
+    read_mutex.lock();
+    pending_read = true;
+    auto result = readBufQueue_.preallocate(40960, 65536);
+    *bufReturn = result.first;
+    *lenReturn = result.second;
 }
 
 void FizzClientConnection::readDataAvailable(size_t len) noexcept {
-    // std::cout << "Client::readDataAvailable: Reading available data of size " << len << std::endl;
-    // Commit the bytes that were read into the queue
     readBufQueue_.postallocate(len);
     bytesRead += len;
-    //Wipe the number of held locks.
-    size_t nb_lock_releases = pending_read_lock_numbers.exchange(0);
-    // std::cout << "We will be releasing " << nb_lock_releases << " locks" << std::endl;
-    for (int i=0; i < nb_lock_releases; i++) {
-      read_mutex.unlock();
+    pending_read = false;
+    read_mutex.unlock();
+    if (read_waker) {
+        wake_read_waker(**read_waker);
     }
 }
 
 void FizzClientConnection::readEOF() noexcept {
     readEof.store(true, std::memory_order_release);
+    if (pending_read) {
+        pending_read = false;
+        read_mutex.unlock();
+    }
     auto* transport_ = static_cast<fizz::client::AsyncFizzClient*>(transport);
-    // std::cout << "Server closed connection" << std::endl;
     transport_->closeNow();
+    if (read_waker) {
+        wake_read_waker(**read_waker);
+    }
 }
 
 void FizzClientConnection::readErr(const folly::AsyncSocketException& ex) noexcept {
     errorMessage = ex.what();
     std::cerr << "Got error" << errorMessage << std::endl;
+    if (pending_read) {
+        pending_read = false;
+        read_mutex.unlock();
+    }
     auto* transport_ = static_cast<fizz::client::AsyncFizzClient*>(transport);
     transport_->closeNow();
 }
@@ -447,19 +449,19 @@ void client_connection_handshake(FizzClientConnection& conn) {
                 sni,
                 folly::none, // PSK identity
                 folly::none, // ECH configs
-                std::chrono::milliseconds(30000) // 30 second handshake timeout
+                std::chrono::milliseconds(120000) // match outer wait; stress / many connections
             );
         });
 
         // // Wait for handshake to complete (processed by EventBase thread)
         auto startTime = std::chrono::steady_clock::now();
-        const auto timeout = std::chrono::seconds(30); // 30 second timeout
+        const auto timeout = std::chrono::seconds(120);
 
         while (!conn.handshakeComplete && conn.errorMessage.empty()) {
             // Check timeout
             auto elapsed = std::chrono::steady_clock::now() - startTime;
             if (elapsed > timeout) {
-                throw std::runtime_error("Handshake timed out after 30 seconds");
+                throw std::runtime_error("Handshake timed out after 120 seconds");
             }
             // Just sleep - EventBase thread will process the handshake
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -478,6 +480,105 @@ void client_connection_handshake(FizzClientConnection& conn) {
     } catch (const std::exception& e) {
         conn.handshakeComplete = false;
         throw std::runtime_error("Client handshake failed: " + std::string(e.what()));
+    }
+}
+
+void client_connection_handshake_async(
+    FizzClientConnection& conn,
+    rust::Box<IoContext> context) {
+    if (!conn.transport) {
+        throw std::runtime_error("No transport available");
+    }
+
+    auto* transport = static_cast<fizz::client::AsyncFizzClient*>(conn.transport);
+
+    class ClientHandshakeCallbackAsync
+        : public fizz::client::AsyncFizzClient::HandshakeCallback {
+        FizzClientConnection* conn_;
+        rust::Box<IoContext> context_;
+
+    public:
+        ClientHandshakeCallbackAsync(
+            FizzClientConnection* conn,
+            rust::Box<IoContext> ctx)
+            : conn_(conn), context_(std::move(ctx)) {}
+
+        void fizzHandshakeSuccess(
+            fizz::client::AsyncFizzClient* client) noexcept override {
+            try {
+                const auto& state = client->getState();
+                auto serverCert = state.serverCert();
+                if (!serverCert) {
+                    handle_io_result(
+                        std::move(context_), 0,
+                        rust::String("No server certificate after handshake"));
+                    return;
+                }
+
+                const auto* peerDC =
+                    dynamic_cast<const fizz::extensions::PeerDelegatedCredential*>(
+                        serverCert.get());
+                if (!peerDC) {
+                    handle_io_result(
+                        std::move(context_), 0,
+                        rust::String("Server did not present a delegated credential certificate"));
+                    return;
+                }
+
+                std::string mismatch =
+                    verifyVerificationInfoAgainstPeerDelegatedCredential(*conn_, *peerDC);
+                if (!mismatch.empty()) {
+                    client->closeNow();
+                    handle_io_result(
+                        std::move(context_), 0, rust::String(mismatch));
+                    return;
+                }
+
+                conn_->peerCertPem = "[Certificate extracted successfully]";
+                client->setReadCB(conn_);
+                conn_->handshakeComplete = true;
+                handle_io_result(std::move(context_), 0, rust::String(""));
+            } catch (const std::exception& e) {
+                handle_io_result(
+                    std::move(context_), 0,
+                    rust::String(
+                        std::string("Failed to verify delegated credential: ") +
+                        e.what()));
+            }
+        }
+
+        void fizzHandshakeError(
+            fizz::client::AsyncFizzClient*,
+            folly::exception_wrapper ex) noexcept override {
+            conn_->errorMessage = ex.what().toStdString();
+            handle_io_result(
+                std::move(context_), 0, rust::String(conn_->errorMessage));
+        }
+    };
+
+    std::string sniHostname = conn.peerCertPem;
+    conn.peerCertPem.clear();
+
+    std::shared_ptr<const fizz::CertificateVerifier> verifier = conn.verifier;
+
+    folly::Optional<std::string> sni = sniHostname.empty()
+        ? folly::none
+        : folly::Optional<std::string>(sniHostname);
+
+    auto* callback =
+        new ClientHandshakeCallbackAsync(&conn, std::move(context));
+
+    try {
+        conn.evb->runInEventBaseThreadAndWait([&]() {
+            transport->connect(
+                callback, verifier, sni,
+                folly::none,
+                folly::none,
+                std::chrono::milliseconds(120000));
+        });
+    } catch (...) {
+        delete callback;
+        throw;
     }
 }
 
@@ -531,33 +632,23 @@ size_t client_connection_read(
 
         if (!conn.transport) {
             throw std::runtime_error("No transport available");
-            
         }
 
-        std::lock_guard<std::recursive_mutex> lock(conn.read_mutex);
-        // Consume bytes from the queue and copy to Rust buffer
+        std::lock_guard<std::mutex> lock(conn.read_mutex);
         size_t bytesRead_ = conn.bytesRead.load();
         if (bytesRead_ == 0) {
             return 0;
         }
 
-        // std::cout << "C++ client read: Holding " << bytesRead_ << " bytes up for read" << std::endl;
-
-        // Split the requested bytes from the queue
         size_t toRead = std::min(bytesRead_, buf.size());
         auto data = conn.readBufQueue_.split(toRead);
 
-        // std::cout << "C++ client read: Intending to read " << toRead << " bytes" << std::endl;
-
-        // Copy data from IOBuf chain to Rust buffer
         size_t copied = 0;
         for (const auto& bufNode : *data) {
             size_t toCopy = std::min(bufNode.size(), buf.size() - copied);
             std::memcpy(const_cast<uint8_t*>(buf.data()) + copied, bufNode.data(), toCopy);
             copied += toCopy;
         }
-
-        // std::cout << "C++ client read: Ended up reading " << copied << " bytes" << std::endl;
 
         conn.bytesRead -= toRead;
         return copied;
@@ -575,6 +666,67 @@ bool client_connection_read_eof(const FizzClientConnection& conn) {
     return conn.readEof.load(std::memory_order_acquire);
 }
 
+ReadOutcome client_connection_read_or_status(
+    FizzClientConnection& conn,
+    rust::Slice<uint8_t> buf) {
+    if (!conn.handshakeComplete) {
+        throw std::runtime_error("Cannot read: handshake not complete");
+    }
+    if (!conn.transport) {
+        throw std::runtime_error("No transport available");
+    }
+
+    std::lock_guard<std::mutex> lock(conn.read_mutex);
+    size_t bytesRead_ = conn.bytesRead.load();
+    if (bytesRead_ == 0) {
+        return ReadOutcome{0, conn.readEof.load(std::memory_order_acquire)};
+    }
+
+    size_t toRead = std::min(bytesRead_, buf.size());
+    auto data = conn.readBufQueue_.split(toRead);
+
+    size_t copied = 0;
+    for (const auto& bufNode : *data) {
+        size_t toCopy = std::min(bufNode.size(), buf.size() - copied);
+        std::memcpy(const_cast<uint8_t*>(buf.data()) + copied, bufNode.data(), toCopy);
+        copied += toCopy;
+    }
+
+    conn.bytesRead -= toRead;
+    return ReadOutcome{static_cast<uint64_t>(copied), false};
+}
+
+namespace {
+// Heap-allocated, self-deleting write callback. Records errors on the conn
+// for the next `client_connection_write` to observe.
+class AsyncClientWriteCallback
+    : public folly::AsyncTransportWrapper::WriteCallback {
+    FizzClientConnection* conn_;
+public:
+    explicit AsyncClientWriteCallback(FizzClientConnection* conn) : conn_(conn) {}
+
+    void writeSuccess() noexcept override {
+        delete this;
+    }
+
+    void writeErr(
+        size_t /*bytesWritten*/,
+        const folly::AsyncSocketException& ex) noexcept override {
+        {
+            std::lock_guard<std::mutex> lock(conn_->writeErrorMutex);
+            conn_->writeErrorMessage = std::string(ex.what());
+        }
+        conn_->writeError.store(true, std::memory_order_release);
+        auto* transport =
+            static_cast<fizz::client::AsyncFizzClient*>(conn_->transport);
+        if (transport) {
+            transport->closeNow();
+        }
+        delete this;
+    }
+};
+}  // namespace
+
 size_t client_connection_write(
     FizzClientConnection& conn,
     rust::Slice<const uint8_t> buf) {
@@ -586,45 +738,29 @@ size_t client_connection_write(
             throw std::runtime_error("No transport available");
         }
 
-        auto* transport = static_cast<fizz::client::AsyncFizzClient*>(conn.transport);
-        // std::cout << "Client: Sync Write" << std::endl;
-        //
-        auto buf_ = folly::IOBuf::copyBuffer(buf.data(), buf.size());
-
-        auto write_length = buf_->length();
-
-        class WriteCallback : public folly::AsyncTransportWrapper::WriteCallback {
-        std::string& ex_string_;
-        bool& error_;
-        fizz::client::AsyncFizzClient* transport_;
-
-        public:
-            WriteCallback(std::string& ex_string, bool& error, fizz::client::AsyncFizzClient* transport): ex_string_(ex_string), error_(error), transport_(transport) {}
-
-            void writeSuccess() noexcept override {
-            }
-
-            void writeErr(size_t /*bytesWritten*/, const folly::AsyncSocketException& ex) noexcept override {
-                std::cerr << "Write failed" << std::endl;
-                ex_string_ = std::string(ex.what());
-                error_ = true;
-                transport_->closeNow();
-            }
-      };
-
-        std::string err_str;
-        bool error = false;
-
-        auto wr_cb = WriteCallback(err_str, error, transport);
-        conn.evb->runInEventBaseThreadAndWait([&]() {
-          transport->writeChain(&wr_cb, std::move(buf_));
-        });
-
-
-        if (error) {
-          throw std::runtime_error("Write failed" + err_str);
+        // Surface any error from a prior fire-and-forget write.
+        if (conn.writeError.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lock(conn.writeErrorMutex);
+            throw std::runtime_error("Write failed: " + conn.writeErrorMessage);
         }
+
+        auto* transport = static_cast<fizz::client::AsyncFizzClient*>(conn.transport);
+        auto buf_ = folly::IOBuf::copyBuffer(buf.data(), buf.size());
+        auto write_length = buf_->length();
+        auto* cb = new AsyncClientWriteCallback(&conn);
+
+        conn.evb->runInEventBaseThread(
+            [transport, cb, b = std::move(buf_)]() mutable {
+                transport->writeChain(cb, std::move(b));
+            });
+
         return write_length;
+}
+
+void set_client_read_waker(
+    FizzClientConnection& conn,
+    rust::Box<ReadWaker> waker) {
+    conn.read_waker = std::move(waker);
 }
 
 rust::String client_connection_peer_cert(const FizzClientConnection& conn) {
