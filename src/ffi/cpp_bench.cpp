@@ -1,11 +1,18 @@
 /*
  * cpp_bench.cpp
  *
- * Pure-C++ fizz+folly echo benchmark for tls_bench_ablation experiment 2a.
- * The Tokio runtime, cxx bridge, and per-connection evb threads in the regular
- * fizz_rs binding are all absent from this code path; only the Rust call into
- * `run_fizz_cpp_bench` and the call back to Rust on return cross the FFI.
- * Two shared `folly::EventBase` threads (one per side) drive every connection.
+ * Pure-C++ fizz+folly echo benchmark for tls_bench_ablation. The Tokio
+ * runtime and cxx bridge present in the regular fizz_rs binding are absent
+ * from this code path; only the Rust call into `run_fizz_cpp_bench` and its
+ * return cross the FFI.
+ *
+ * Threading model intentionally mirrors fizz_rs's binding: one
+ * `folly::EventBase` thread per connection on each side (plus one small
+ * accept evb on the server). This makes `fizz` (Rust binding) vs.
+ * `fizz_cpp` (this binary) an apples-to-apples binding-overhead measurement
+ * at every value of `--pairs` — both sides spend the same number of OS
+ * threads on crypto / I/O, so the only difference is what sits between the
+ * application loop and the fizz state machine.
  */
 
 #define GLOG_USE_GLOG_EXPORT
@@ -348,57 +355,91 @@ private:
     std::atomic<bool> finished_{false};
 };
 
+// One EventBase + worker thread, owning a single connection. Mirrors the
+// per-conn evb threads spawned inside `server_accept_connection` /
+// `client_connect` in the regular fizz_rs binding.
+struct PerConnEvb {
+    std::unique_ptr<folly::EventBase> evb;
+    std::unique_ptr<std::thread> thread;
+};
+
 // ---------------------------------------------------------------------------
-// Server-side acceptor: turns each accepted TCP fd into an EchoServerSession.
+// Server-side acceptor: each accepted TCP fd gets its OWN evb + thread, and
+// the AsyncFizzServer is pinned to that per-conn evb. Listener and accept
+// callback live on a separate small "accept evb" so accepting never blocks
+// any one connection's I/O thread.
 // ---------------------------------------------------------------------------
 
 class BenchAcceptor final : public folly::AsyncServerSocket::AcceptCallback {
 public:
     BenchAcceptor(
         std::shared_ptr<fizz::server::FizzServerContext> serverCtx,
-        folly::EventBase* serverEvb,
         size_t batchSize,
         size_t rounds,
         size_t expectedConns,
-        folly::Promise<folly::Unit> allDone)
+        folly::Promise<folly::Unit> allDone,
+        std::vector<PerConnEvb>* perConnEvbs,
+        std::mutex* perConnMutex)
         : serverCtx_(std::move(serverCtx)),
-          serverEvb_(serverEvb),
           batchSize_(batchSize),
           rounds_(rounds),
           expectedConns_(expectedConns),
-          allDone_(std::move(allDone)) {}
+          allDone_(std::move(allDone)),
+          perConnEvbs_(perConnEvbs),
+          perConnMutex_(perConnMutex) {}
 
     void connectionAccepted(
         folly::NetworkSocket fd,
         const folly::SocketAddress&,
         AcceptInfo) noexcept override {
         try {
-            auto socket = folly::AsyncSocket::newSocket(serverEvb_, fd);
-            auto fizzServer = fizz::server::AsyncFizzServer::UniquePtr(
-                new fizz::server::AsyncFizzServer(std::move(socket), serverCtx_));
+            auto perConn = std::make_unique<folly::EventBase>();
+            auto* evbPtr = perConn.get();
+            auto thread = std::make_unique<std::thread>(
+                [evbPtr] { evbPtr->loopForever(); });
+            {
+                std::lock_guard<std::mutex> lock(*perConnMutex_);
+                perConnEvbs_->push_back(
+                    PerConnEvb{std::move(perConn), std::move(thread)});
+            }
 
-            folly::Promise<folly::Unit> sessionDone;
-            auto sessionFut = sessionDone.getSemiFuture();
-            auto* session = new EchoServerSession(
-                std::move(fizzServer), batchSize_, rounds_, std::move(sessionDone));
-            session->start();
+            evbPtr->runInEventBaseThread([this, fd, evbPtr] {
+                try {
+                    auto socket = folly::AsyncSocket::newSocket(evbPtr, fd);
+                    auto fizzServer = fizz::server::AsyncFizzServer::UniquePtr(
+                        new fizz::server::AsyncFizzServer(
+                            std::move(socket), serverCtx_));
 
-            std::move(sessionFut).via(serverEvb_).thenTry(
-                [this](folly::Try<folly::Unit> t) {
-                    if (fired_) return;
-                    if (t.hasException()) {
-                        fired_ = true;
-                        allDone_.setException(t.exception());
-                        return;
+                    folly::Promise<folly::Unit> sessionDone;
+                    auto sessionFut = sessionDone.getSemiFuture();
+                    auto* session = new EchoServerSession(
+                        std::move(fizzServer), batchSize_, rounds_,
+                        std::move(sessionDone));
+                    session->start();
+
+                    std::move(sessionFut).via(evbPtr).thenTry(
+                        [this](folly::Try<folly::Unit> t) {
+                            if (fired_.load()) return;
+                            if (t.hasException()) {
+                                if (!fired_.exchange(true)) {
+                                    allDone_.setException(t.exception());
+                                }
+                                return;
+                            }
+                            if (completed_.fetch_add(1) + 1 == expectedConns_ &&
+                                !fired_.exchange(true)) {
+                                allDone_.setValue();
+                            }
+                        });
+                } catch (const std::exception& e) {
+                    if (!fired_.exchange(true)) {
+                        allDone_.setException(std::runtime_error(
+                            std::string("server setup: ") + e.what()));
                     }
-                    if (++completed_ == expectedConns_) {
-                        fired_ = true;
-                        allDone_.setValue();
-                    }
-                });
+                }
+            });
         } catch (const std::exception& e) {
-            if (!fired_) {
-                fired_ = true;
+            if (!fired_.exchange(true)) {
                 allDone_.setException(
                     std::runtime_error(std::string("accept: ") + e.what()));
             }
@@ -406,8 +447,7 @@ public:
     }
 
     void acceptError(folly::exception_wrapper ex) noexcept override {
-        if (!fired_) {
-            fired_ = true;
+        if (!fired_.exchange(true)) {
             allDone_.setException(
                 std::runtime_error("acceptError: " + ex.what().toStdString()));
         }
@@ -415,13 +455,14 @@ public:
 
 private:
     std::shared_ptr<fizz::server::FizzServerContext> serverCtx_;
-    folly::EventBase* serverEvb_;
     size_t batchSize_;
     size_t rounds_;
     size_t expectedConns_;
     folly::Promise<folly::Unit> allDone_;
-    size_t completed_{0};
-    bool fired_{false};
+    std::vector<PerConnEvb>* perConnEvbs_;
+    std::mutex* perConnMutex_;
+    std::atomic<size_t> completed_{0};
+    std::atomic<bool> fired_{false};
 };
 
 }  // namespace
@@ -444,25 +485,33 @@ uint64_t run_fizz_cpp_bench(
     auto clientCtx = clientCtxWrapper.ctx;
     auto verifier = create_verifier(clientCtxWrapper.caCertPath);
 
-    folly::EventBase serverEvb;
-    folly::EventBase clientEvb;
-    std::thread serverThread([&] { serverEvb.loopForever(); });
-    std::thread clientThread([&] { clientEvb.loopForever(); });
+    // Small dedicated evb just for the AsyncServerSocket / accept loop. Per
+    // accepted conn we spawn a fresh evb thread (mirrors fizz_rs binding).
+    folly::EventBase acceptEvb;
+    std::thread acceptThread([&] { acceptEvb.loopForever(); });
+
+    std::vector<PerConnEvb> serverPerConnEvbs;
+    serverPerConnEvbs.reserve(pairs);
+    std::mutex serverPerConnMutex;
+
+    std::vector<PerConnEvb> clientPerConnEvbs;
+    clientPerConnEvbs.reserve(pairs);
 
     folly::Promise<folly::Unit> serverAllDone;
     auto serverAllFut = serverAllDone.getSemiFuture();
 
     auto* acceptor = new BenchAcceptor(
-        serverCtx, &serverEvb, batchSize, rounds, pairs, std::move(serverAllDone));
+        serverCtx, batchSize, rounds, pairs, std::move(serverAllDone),
+        &serverPerConnEvbs, &serverPerConnMutex);
 
     folly::AsyncServerSocket::UniquePtr listener;
     uint16_t port = 0;
-    serverEvb.runInEventBaseThreadAndWait([&] {
+    acceptEvb.runInEventBaseThreadAndWait([&] {
         listener = folly::AsyncServerSocket::UniquePtr(
-            new folly::AsyncServerSocket(&serverEvb));
+            new folly::AsyncServerSocket(&acceptEvb));
         listener->bind(0);
         listener->listen(static_cast<int>(pairs) + 8);
-        listener->addAcceptCallback(acceptor, &serverEvb);
+        listener->addAcceptCallback(acceptor, &acceptEvb);
         listener->startAccepting();
         port = listener->getAddress().getPort();
     });
@@ -476,10 +525,18 @@ uint64_t run_fizz_cpp_bench(
 
     for (uint64_t i = 0; i < pairs; ++i) {
         int tcpFd = blocking_tcp_connect(port);
-        clientEvb.runInEventBaseThread([&, tcpFd] {
+
+        auto perConn = std::make_unique<folly::EventBase>();
+        auto* evbPtr = perConn.get();
+        auto thread = std::make_unique<std::thread>(
+            [evbPtr] { evbPtr->loopForever(); });
+        clientPerConnEvbs.push_back(
+            PerConnEvb{std::move(perConn), std::move(thread)});
+
+        evbPtr->runInEventBaseThread([&, tcpFd, evbPtr] {
             try {
                 folly::NetworkSocket netSock(tcpFd);
-                auto socket = folly::AsyncSocket::newSocket(&clientEvb, netSock);
+                auto socket = folly::AsyncSocket::newSocket(evbPtr, netSock);
                 auto dcExt = std::make_shared<
                     fizz::extensions::DelegatedCredentialClientExtension>(
                     std::vector<fizz::SignatureScheme>{
@@ -500,7 +557,7 @@ uint64_t run_fizz_cpp_bench(
                     batchSize, rounds, std::move(sessionDone));
                 session->start();
 
-                std::move(sessionFut).via(&clientEvb).thenTry(
+                std::move(sessionFut).via(evbPtr).thenTry(
                     [&](folly::Try<folly::Unit> t) {
                         if (clientFired.load()) return;
                         if (t.hasException()) {
@@ -529,16 +586,29 @@ uint64_t run_fizz_cpp_bench(
 
     auto t1 = std::chrono::steady_clock::now();
 
-    serverEvb.runInEventBaseThreadAndWait([&] {
+    acceptEvb.runInEventBaseThreadAndWait([&] {
         listener->stopAccepting();
         listener.reset();
     });
     delete acceptor;
 
-    serverEvb.terminateLoopSoon();
-    clientEvb.terminateLoopSoon();
-    serverThread.join();
-    clientThread.join();
+    acceptEvb.terminateLoopSoon();
+    acceptThread.join();
+
+    // Stop every per-conn evb, then join all threads. Done in two passes so
+    // teardown isn't serialized one thread at a time.
+    for (auto& pc : serverPerConnEvbs) {
+        pc.evb->terminateLoopSoon();
+    }
+    for (auto& pc : clientPerConnEvbs) {
+        pc.evb->terminateLoopSoon();
+    }
+    for (auto& pc : serverPerConnEvbs) {
+        pc.thread->join();
+    }
+    for (auto& pc : clientPerConnEvbs) {
+        pc.thread->join();
+    }
 
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());

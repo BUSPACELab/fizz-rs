@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/tls_bench", "crates/tls_bench_ablation"]
+members = [".", "crates/tls_bench_ablation"]
 resolver = "2"
 
 # Keep line-level debug info in release builds so profilers (samply, instruments,

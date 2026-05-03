@@ -1,0 +1,136 @@
+# Manual benchmark: builds the release binary, runs `tls_bench_ablation`
+# over a sweep of N (concurrent connection counts), generates the
+# USENIX-style throughput-vs-N plot, and uploads the CSV + PDF + PNG as
+# workflow artifacts.
+#
+# Triggered manually via the "Run workflow" button (workflow_dispatch). It is
+# expensive — the first run on a cache miss can spend ~30–60 minutes building
+# fizz/folly via getdeps — so we don't run it on every PR.
+name: benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairs_sweep:
+        description: 'Comma-separated N values (e.g. "1,2,4,8,16,32,64")'
+        required: false
+        default: '1,2,4,8,16,32,64'
+      batch_size:
+        description: 'Echo payload size in bytes'
+        required: false
+        default: '65536'
+      rounds:
+        description: 'Echo cycles per client at each N'
+        required: false
+        default: '64'
+      runs:
+        description: 'Timed iterations per (backend, N), median reported'
+        required: false
+        default: '3'
+      warmup:
+        description: 'Warmup iterations to discard before timing'
+        required: false
+        default: '1'
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: benchmark
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Fizz system dependencies (getdeps)
+        working-directory: third_party/fizz
+        run: |
+          sudo python3 build/fbcode_builder/getdeps.py \
+            --allow-system-packages install-system-deps --recursive fizz
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fizz-rs
+
+      - name: Build tls_bench_ablation (release)
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+        run: cargo build --release -p tls_bench_ablation
+
+      # One invocation per (backend, N). This avoids a fizz_rs lifecycle bug
+      # that surfaces when --all-backends + --pairs-sweep stack many runs of
+      # different backends in the same process at high N (segfault during the
+      # rustls→fizz transition past pairs≈32). Each invocation is independent
+      # so any leaked state from a prior backend can't affect the next run.
+      - name: Run scaling sweep (per-backend, per-N)
+        run: |
+          set -e
+          OUT=scaling_results.csv
+          echo "backend,pairs,client_workers,server_workers,max_blocking_threads,batch_size,rounds,wall_ms,total_bytes,mb_per_s,error" > "$OUT"
+          IFS=',' read -ra NS <<< "${{ github.event.inputs.pairs_sweep }}"
+          for N in "${NS[@]}"; do
+            for BACKEND in tcp rustls fizz fizz-cpp; do
+              echo ">>> N=$N backend=$BACKEND" >&2
+              ./target/release/tls_bench_ablation \
+                --backend "$BACKEND" --pairs "$N" \
+                --batch-size ${{ github.event.inputs.batch_size }} \
+                --rounds ${{ github.event.inputs.rounds }} \
+                --warmup ${{ github.event.inputs.warmup }} \
+                --runs ${{ github.event.inputs.runs }} \
+                >> "$OUT"
+            done
+          done
+          echo "--- $OUT ---"
+          cat "$OUT"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Sync plotting environment
+        run: uv sync --project scripts/benchmarking --frozen
+
+      - name: Generate plot
+        run: |
+          uv run --project scripts/benchmarking \
+            python scripts/benchmarking/plot_scaling.py \
+            scaling_results.csv scaling_results
+
+      - name: Upload CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: scaling_results.csv
+          path: scaling_results.csv
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload PDF
+        uses: actions/upload-artifact@v4
+        with:
+          name: scaling_results.pdf
+          path: scaling_results.pdf
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload PNG
+        uses: actions/upload-artifact@v4
+        with:
+          name: scaling_results.png
+          path: scaling_results.png
+          if-no-files-found: error
+          retention-days: 30

@@ -62,6 +62,13 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     pairs: usize,
 
+    /// Comma-separated list of pairs values to sweep (e.g. "1,2,4,8,16,32").
+    /// When set, overrides `--pairs` and emits one CSV row per (backend, N).
+    /// Each N rebuilds the two Tokio runtimes sized to N workers / N blocking
+    /// threads, preserving the ablation invariant at every scale point.
+    #[arg(long, value_delimiter = ',')]
+    pairs_sweep: Option<Vec<usize>>,
+
     #[arg(long, default_value_t = 16 * 1024)]
     batch_size: usize,
 
@@ -388,7 +395,6 @@ fn build_runtime(workers: usize, blocking: usize, name: &'static str) -> Result<
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let pairs = cli.pairs.max(1);
     let batch_size = cli.batch_size;
     let rounds = cli.rounds;
     let runs = cli.runs;
@@ -401,6 +407,11 @@ fn main() -> Result<()> {
             .context("pass --backend or use --all-backends")?]
     };
 
+    let pairs_values: Vec<usize> = match cli.pairs_sweep.as_ref() {
+        Some(v) if !v.is_empty() => v.iter().map(|n| (*n).max(1)).collect(),
+        _ => vec![cli.pairs.max(1)],
+    };
+
     let rustls_cfgs = rustls_configs().ok();
     let fizz_ctxs = load_fizz_materials().ok().map(|(cp, dc, vi, ca_path)| {
         let server = ServerTlsContext::new(cp, dc).expect("fizz server ctx");
@@ -408,14 +419,15 @@ fn main() -> Result<()> {
         (Arc::new(server), Arc::new(client))
     });
 
-    let client_rt = build_runtime(pairs, pairs, "ablation-client")?;
-    let server_rt = build_runtime(pairs, pairs, "ablation-server")?;
-
     if cli.csv_header {
         println!(
             "backend,pairs,client_workers,server_workers,max_blocking_threads,batch_size,rounds,wall_ms,total_bytes,mb_per_s,error"
         );
     }
+
+    for &pairs in &pairs_values {
+    let client_rt = build_runtime(pairs, pairs, "ablation-client")?;
+    let server_rt = build_runtime(pairs, pairs, "ablation-server")?;
 
     let client_workers = pairs;
     let server_workers = pairs;
@@ -426,7 +438,7 @@ fn main() -> Result<()> {
         .saturating_mul(rounds as u64)
         .saturating_mul(batch_size as u64);
 
-    for backend in backends {
+    for backend in backends.iter().copied() {
         if matches!(backend, Backend::Rustls) && rustls_cfgs.is_none() {
             eprintln!("rustls: skipping (failed to build configs)");
             println!(
@@ -530,6 +542,7 @@ fn main() -> Result<()> {
             total_bytes,
             mb_per_s
         );
+    }
     }
 
     Ok(())

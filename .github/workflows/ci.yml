@@ -52,7 +52,7 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
         run: cargo test
 
-      - name: Build tls_bench
+      - name: Build tls_bench_ablation
         env:
           SCCACHE_GHA_ENABLED: "true"
-        run: cargo build -p tls_bench
+        run: cargo build -p tls_bench_ablation
