@@ -66,36 +66,120 @@ jobs:
         with:
           shared-key: fizz-rs
 
+      # The dominant build cost is `getdeps build fizz` (folly + fast_float +
+      # oqs + ...). Its install tree lives under `target/release/build/fizz_rs-*/out/fizz-install/`.
+      # Swatinem's cache may prune it, so we restore it explicitly here keyed
+      # on the third_party/fizz submodule SHA. As long as the SHA is stable,
+      # getdeps short-circuits and the build drops from ~16 min to a few min.
+      - name: Compute fizz submodule SHA
+        id: fizz-sha
+        run: |
+          SHA=$(git -C third_party/fizz rev-parse HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "fizz submodule SHA: $SHA"
+
+      - name: Cache fizz/folly install tree
+        uses: actions/cache@v4
+        with:
+          path: target/release/build/fizz_rs-*/out/fizz-install
+          key: fizz-install-${{ runner.os }}-${{ steps.fizz-sha.outputs.sha }}
+          restore-keys: |
+            fizz-install-${{ runner.os }}-
+
       - name: Build tls_bench_ablation (release)
         env:
           SCCACHE_GHA_ENABLED: "true"
         run: cargo build --release -p tls_bench_ablation
 
-      # One invocation per (backend, N). This avoids a fizz_rs lifecycle bug
-      # that surfaces when --all-backends + --pairs-sweep stack many runs of
-      # different backends in the same process at high N (segfault during the
-      # rustls→fizz transition past pairs≈32). Each invocation is independent
-      # so any leaked state from a prior backend can't affect the next run.
+      # Allow core dumps so a backtrace can be captured if the bench segfaults.
+      # Writes cores to a known directory readable by subsequent steps. The
+      # `ulimit -c unlimited` inside the actual sweep step is what enables core
+      # generation for the bench process — runner-level sysctls only set the
+      # *path* and the system-level limits.
+      - name: Configure core dumps and install gdb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdb
+          sudo mkdir -p /cores
+          sudo chmod 1777 /cores
+          sudo sysctl -w kernel.core_pattern='/cores/core.%e.%p'
+          # Disable apport so it doesn't intercept the dump.
+          if [ -d /etc/apport ]; then
+            sudo systemctl stop apport.service 2>/dev/null || true
+            echo "enabled=0" | sudo tee /etc/default/apport > /dev/null || true
+          fi
+          ulimit -c unlimited
+          echo "core_pattern=$(cat /proc/sys/kernel/core_pattern)"
+
+      # One invocation per (backend, N). Each invocation is independent so any
+      # leaked state from a prior backend can't affect the next run. We allow
+      # the loop to continue past a crashing invocation (without `set -e`) so
+      # we capture the core dump and a partial CSV; the workflow still fails
+      # at the end via `exit $bench_status` if any invocation crashed.
       - name: Run scaling sweep (per-backend, per-N)
         run: |
-          set -e
+          ulimit -c unlimited
           OUT=scaling_results.csv
           echo "backend,pairs,client_workers,server_workers,max_blocking_threads,batch_size,rounds,wall_ms,total_bytes,mb_per_s,error" > "$OUT"
           IFS=',' read -ra NS <<< "${{ github.event.inputs.pairs_sweep }}"
+          bench_status=0
           for N in "${NS[@]}"; do
             for BACKEND in tcp rustls fizz fizz-cpp; do
               echo ">>> N=$N backend=$BACKEND" >&2
-              ./target/release/tls_bench_ablation \
-                --backend "$BACKEND" --pairs "$N" \
-                --batch-size ${{ github.event.inputs.batch_size }} \
-                --rounds ${{ github.event.inputs.rounds }} \
-                --warmup ${{ github.event.inputs.warmup }} \
-                --runs ${{ github.event.inputs.runs }} \
-                >> "$OUT"
+              if ! ./target/release/tls_bench_ablation \
+                    --backend "$BACKEND" --pairs "$N" \
+                    --batch-size ${{ github.event.inputs.batch_size }} \
+                    --rounds ${{ github.event.inputs.rounds }} \
+                    --warmup ${{ github.event.inputs.warmup }} \
+                    --runs ${{ github.event.inputs.runs }} \
+                    >> "$OUT"; then
+                rc=$?
+                echo "!!! crashed: N=$N backend=$BACKEND exit=$rc" >&2
+                bench_status=$rc
+                # Continue so we get every backend's crash recorded, but stop
+                # after the first crash for THIS N to avoid corrupting state.
+                break 2
+              fi
             done
           done
           echo "--- $OUT ---"
           cat "$OUT"
+          exit $bench_status
+
+      - name: Capture backtrace from core dump (on failure)
+        if: failure()
+        run: |
+          set +e
+          ls -la /cores/ || true
+          shopt -s nullglob
+          for c in /cores/core.*; do
+            echo "============================================================"
+            echo "core dump: $c"
+            echo "============================================================"
+            file "$c" || true
+            gdb --batch \
+              --quiet \
+              -ex "set print pretty on" \
+              -ex "set print thread-events off" \
+              -ex "info threads" \
+              -ex "thread apply all bt full" \
+              ./target/release/tls_bench_ablation "$c" 2>&1 | tee -a /cores/backtrace.txt
+            echo
+          done
+          if [ ! -s /cores/backtrace.txt ]; then
+            echo "no core dump found in /cores/" | tee /cores/backtrace.txt
+            echo "ulimit -c was: $(ulimit -c)"
+            echo "kernel.core_pattern was: $(cat /proc/sys/kernel/core_pattern 2>/dev/null || echo unknown)"
+          fi
+
+      - name: Upload core dumps and backtrace (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-dumps
+          path: /cores/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
