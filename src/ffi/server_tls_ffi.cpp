@@ -152,24 +152,19 @@ FizzServerConnection::~FizzServerConnection() {
 }
 
 void FizzServerConnection::getReadBuffer(void** bufReturn, size_t* lenReturn) {
-  // Preallocate buffer in the queue - min 4096 bytes
-  // std::cout << "Server_side: About to acquire the lock" << std::endl;
-  read_mutex.lock();
-  pending_read_lock_numbers += 1;
-  // std::cout << "Server_side: Acquired the lock" << std::endl;
-  auto result = readBufQueue_.preallocate(40960, 65536);
-  *bufReturn = result.first;
-  *lenReturn = result.second;
+    // Held until the matched readDataAvailable / readEOF / readErr fires.
+    read_mutex.lock();
+    pending_read = true;
+    auto result = readBufQueue_.preallocate(40960, 65536);
+    *bufReturn = result.first;
+    *lenReturn = result.second;
 }
 
 void FizzServerConnection::readDataAvailable(size_t len) noexcept {
-    // Commit the bytes that were read into the queue
     readBufQueue_.postallocate(len);
     bytesRead += len;
-    size_t nb_lock_releases = pending_read_lock_numbers.exchange(0);
-    for (int i=0; i < nb_lock_releases; i++) {
-      read_mutex.unlock();
-    }
+    pending_read = false;
+    read_mutex.unlock();
     if (read_waker) {
         wake_read_waker(**read_waker);
     }
@@ -177,6 +172,10 @@ void FizzServerConnection::readDataAvailable(size_t len) noexcept {
 
 void FizzServerConnection::readEOF() noexcept {
     readEof.store(true, std::memory_order_release);
+    if (pending_read) {
+        pending_read = false;
+        read_mutex.unlock();
+    }
     auto* transport_ = static_cast<fizz::server::AsyncFizzServer*>(transport);
     transport_->closeNow();
     if (read_waker) {
@@ -187,6 +186,10 @@ void FizzServerConnection::readEOF() noexcept {
 void FizzServerConnection::readErr(const folly::AsyncSocketException& ex) noexcept {
     errorMessage = ex.what();
     std::cerr << "Got error" << errorMessage << std::endl;
+    if (pending_read) {
+        pending_read = false;
+        read_mutex.unlock();
+    }
     auto* transport_ = static_cast<fizz::server::AsyncFizzServer*>(transport);
     transport_->closeNow();
 }
@@ -421,22 +424,15 @@ size_t server_connection_read(
             throw std::runtime_error("No transport available");
         }
 
-
-        std::lock_guard<std::recursive_mutex> lock(conn.read_mutex);
-        //No read happened.
+        std::lock_guard<std::mutex> lock(conn.read_mutex);
         auto bytesRead_ = conn.bytesRead.load();
         if (bytesRead_ == 0) {
             return 0;
         }
 
-
-        // std::cout << "C++ server read: Holding " << bytesRead_ << " bytes up for read" << std::endl;
-        // Split the requested bytes from the queue
         size_t toRead = std::min(bytesRead_, buf.size());
         auto data = conn.readBufQueue_.split(toRead);
-        // std::cout << "C++ server read: Intending to read " << toRead << " bytes" << std::endl;
 
-        // Copy data from IOBuf chain to Rust buffer
         size_t copied = 0;
         for (const auto& bufNode : *data) {
             size_t toCopy = std::min(bufNode.size(), buf.size() - copied);
@@ -444,13 +440,42 @@ size_t server_connection_read(
             copied += toCopy;
         }
 
-        // std::cout << "C++ server read: Ended up reading " << copied << " bytes" << std::endl;
         conn.bytesRead -= toRead;
         return copied;
 
     } catch (const std::exception& e) {
         throw std::runtime_error("Failed to read: " + std::string(e.what()));
     }
+}
+
+ReadOutcome server_connection_read_or_status(
+    FizzServerConnection& conn,
+    rust::Slice<uint8_t> buf) {
+    if (!conn.handshakeComplete) {
+        throw std::runtime_error("Cannot read: handshake not complete");
+    }
+    if (!conn.transport) {
+        throw std::runtime_error("No transport available");
+    }
+
+    std::lock_guard<std::mutex> lock(conn.read_mutex);
+    auto bytesRead_ = conn.bytesRead.load();
+    if (bytesRead_ == 0) {
+        return ReadOutcome{0, conn.readEof.load(std::memory_order_acquire)};
+    }
+
+    size_t toRead = std::min(bytesRead_, buf.size());
+    auto data = conn.readBufQueue_.split(toRead);
+
+    size_t copied = 0;
+    for (const auto& bufNode : *data) {
+        size_t toCopy = std::min(bufNode.size(), buf.size() - copied);
+        std::memcpy(const_cast<uint8_t*>(buf.data()) + copied, bufNode.data(), toCopy);
+        copied += toCopy;
+    }
+
+    conn.bytesRead -= toRead;
+    return ReadOutcome{static_cast<uint64_t>(copied), false};
 }
 
 

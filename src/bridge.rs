@@ -81,6 +81,16 @@ pub mod ffi {
         pub sig_schemes: Vec<u16>,
     }
 
+    /// Outcome of a coalesced poll-read FFI call. Avoids 2-3 cxx round-trips
+    /// (size_hint + read_eof + read) per `poll_read`.
+    #[derive(Debug, Clone, Copy)]
+    pub struct ReadOutcome {
+        /// Number of bytes actually copied into the caller's buffer.
+        pub bytes_read: u64,
+        /// True iff the peer has closed and no more data will arrive.
+        pub eof: bool,
+    }
+
     // ============================================================================
     // Rust Types Exposed to C++ (Async Contexts)
     // ============================================================================
@@ -228,6 +238,14 @@ pub mod ffi {
         /// True after the peer has closed the TLS stream (`readEOF`); no more app data will arrive.
         fn server_connection_read_eof(conn: &FizzServerConnection) -> bool;
 
+        /// Coalesced read: take the read mutex once, return both bytes_read
+        /// and eof in a single FFI round-trip. Replaces the size_hint + read +
+        /// read_eof sequence that `poll_read` used to perform.
+        fn server_connection_read_or_status(
+            conn: Pin<&mut FizzServerConnection>,
+            buf: &mut [u8],
+        ) -> Result<ReadOutcome>;
+
         /// Write data to connection
         fn server_connection_write(
             conn: Pin<&mut FizzServerConnection>,
@@ -283,6 +301,12 @@ pub mod ffi {
 
         fn client_connection_read_eof(conn: &FizzClientConnection) -> bool;
 
+        /// Coalesced read — see `server_connection_read_or_status`.
+        fn client_connection_read_or_status(
+            conn: Pin<&mut FizzClientConnection>,
+            buf: &mut [u8],
+        ) -> Result<ReadOutcome>;
+
         /// Write data to connection
         fn client_connection_write(
             conn: Pin<&mut FizzClientConnection>,
@@ -319,6 +343,17 @@ pub mod ffi {
             conn: Pin<&mut FizzClientConnection>,
             waker: Box<ReadWaker>,
         );
+
+        /// Pure-C++ fizz+folly echo benchmark — see `src/ffi/cpp_bench.h`.
+        /// Returns wall time in microseconds. Bypasses Tokio entirely; the only
+        /// FFI crossings are this call and its return.
+        fn run_fizz_cpp_bench(
+            server_ctx: &FizzServerContext,
+            client_ctx: &FizzClientContext,
+            pairs: u64,
+            batch_size: u64,
+            rounds: u64,
+        ) -> Result<u64>;
     }
 }
 

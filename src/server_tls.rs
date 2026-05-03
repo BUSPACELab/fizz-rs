@@ -32,6 +32,11 @@ unsafe impl Send for ServerTlsContext {}
 unsafe impl Sync for ServerTlsContext {}
 
 impl ServerTlsContext {
+    /// Crate-internal accessor for the CXX context. Used by `fizz_rs::cpp_bench`.
+    pub(crate) fn cxx_ref(&self) -> &ffi::FizzServerContext {
+        &*self.inner
+    }
+
     /// Create a new server TLS context
     ///
     /// # Security
@@ -217,38 +222,25 @@ impl tokio::io::AsyncRead for ServerConnection {
         // will still hit the registered waker and cause us to be re-polled.
         self.read_waker.register(cx.waker());
 
-        let read_size = match ffi::server_read_size_hint(self.inner.pin_mut()) {
-            Ok(n) => n,
-            Err(e) => {
-                return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
-            }
-        };
-
-        if read_size == 0 {
-            if ffi::server_connection_read_eof(&self.inner) {
-                return Poll::Ready(Ok(()));
-            }
-            return Poll::Pending;
-        }
-
         let buf_slice = buf.initialize_unfilled();
 
-        let read = match ffi::server_connection_read(self.inner.pin_mut(), buf_slice) {
-            Ok(n) => n,
+        let outcome = match ffi::server_connection_read_or_status(self.inner.pin_mut(), buf_slice) {
+            Ok(o) => o,
             Err(e) => {
                 return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
             }
         };
 
-        if read == 0 {
-            if ffi::server_connection_read_eof(&self.inner) {
-                return Poll::Ready(Ok(()));
-            }
-            return Poll::Pending;
+        if outcome.bytes_read > 0 {
+            buf.advance(outcome.bytes_read as usize);
+            return Poll::Ready(Ok(()));
         }
 
-        buf.advance(read);
-        Poll::Ready(Ok(()))
+        if outcome.eof {
+            return Poll::Ready(Ok(()));
+        }
+
+        Poll::Pending
     }
 }
 

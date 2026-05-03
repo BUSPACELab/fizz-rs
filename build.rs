@@ -143,6 +143,7 @@ fn build_bridge(fizz_dependencies: &Vec<String>) {
         .file("src/ffi/credentials_ffi.cpp")
         .file("src/ffi/server_tls_ffi.cpp")
         .file("src/ffi/client_tls_ffi.cpp")
+        .file("src/ffi/cpp_bench.cpp")
         // Set C++ standard (Folly requires C++17)
         .flag_if_supported("-std=c++17")
         .flag_if_supported("/std:c++17") // MSVC
@@ -233,6 +234,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ffi/credentials_ffi.cpp");
     println!("cargo:rerun-if-changed=src/ffi/server_tls_ffi.cpp");
     println!("cargo:rerun-if-changed=src/ffi/client_tls_ffi.cpp");
+    println!("cargo:rerun-if-changed=src/ffi/cpp_bench.cpp");
+    println!("cargo:rerun-if-changed=src/ffi/cpp_bench.h");
     println!("cargo:rerun-if-changed=patches/fizz-homebrew-openssl.patch");
     println!("cargo:rerun-if-changed=patches/fizz-getdeps-pin-git-rev.patch");
 }

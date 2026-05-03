@@ -29,6 +29,9 @@ enum Backend {
     Tcp,
     Rustls,
     Fizz,
+    /// Pure-C++ fizz+folly delegated TLS, no Tokio / no cxx on the hot path.
+    /// Used as the reference point for measuring binding overhead in 2a.
+    FizzCpp,
 }
 
 fn backend_csv(b: Backend) -> &'static str {
@@ -36,6 +39,7 @@ fn backend_csv(b: Backend) -> &'static str {
         Backend::Tcp => "tcp",
         Backend::Rustls => "rustls",
         Backend::Fizz => "fizz",
+        Backend::FizzCpp => "fizz_cpp",
     }
 }
 
@@ -340,6 +344,20 @@ fn run_backend(
                 c.clone(),
             )
         }
+        Backend::FizzCpp => {
+            let (s, c) = fizz.as_ref().context("fizz contexts missing")?;
+            // Pure-C++ benchmark: bypass both Tokio runtimes; the C++ side
+            // runs the workload on its own folly EventBase threads.
+            fizz_rs::cpp_bench::run(
+                s.as_ref(),
+                c.as_ref(),
+                pairs as u64,
+                batch_size as u64,
+                rounds as u64,
+            )
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("fizz_cpp: {e}"))
+        }
     }
 }
 
@@ -376,7 +394,7 @@ fn main() -> Result<()> {
     let runs = cli.runs;
 
     let backends: Vec<Backend> = if cli.all_backends {
-        vec![Backend::Tcp, Backend::Rustls, Backend::Fizz]
+        vec![Backend::Tcp, Backend::Rustls, Backend::Fizz, Backend::FizzCpp]
     } else {
         vec![cli
             .backend
@@ -423,9 +441,10 @@ fn main() -> Result<()> {
             );
             continue;
         }
-        if matches!(backend, Backend::Fizz) && fizz_ctxs.is_none() {
+        if matches!(backend, Backend::Fizz | Backend::FizzCpp) && fizz_ctxs.is_none() {
             eprintln!(
-                "fizz: skipping (failed to load {} — run from repo with tests/fixtures)",
+                "{}: skipping (failed to load {} — run from repo with tests/fixtures)",
+                backend_csv(backend),
                 fixtures_dir().display()
             );
             println!(
