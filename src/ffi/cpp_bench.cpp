@@ -47,6 +47,7 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -126,6 +127,12 @@ int blocking_tcp_connect(uint16_t port) {
 // batches have been written. Self-deletes when finished.
 // ---------------------------------------------------------------------------
 
+// Session lifecycle: callbacks (read*, write*, handshake*) all fire on the
+// per-conn evb thread, so plain bools / counters are safe — no atomic needed.
+// We track reads_remaining_ and writes_in_flight_ separately and only delete
+// the session once both reach zero (or an error has stopped us AND no writes
+// are pending). This prevents the UAF that occurred when readEOF / read of
+// the last echo deleted the session before a queued writeSuccess fired.
 class EchoServerSession final
     : public fizz::server::AsyncFizzServer::HandshakeCallback,
       public folly::AsyncTransportWrapper::ReadCallback,
@@ -138,7 +145,7 @@ public:
         folly::Promise<folly::Unit> done)
         : server_(std::move(server)),
           batchSize_(batchSize),
-          remaining_(rounds),
+          reads_remaining_(rounds),
           done_(std::move(done)) {}
 
     void start() { server_->accept(this); }
@@ -146,15 +153,19 @@ public:
     // HandshakeCallback
     void fizzHandshakeSuccess(fizz::server::AsyncFizzServer*) noexcept override {
         server_->setReadCB(this);
+        if (reads_remaining_ == 0) {
+            stopped_ = true;
+            maybeFinish();
+        }
     }
     void fizzHandshakeError(
         fizz::server::AsyncFizzServer*,
         folly::exception_wrapper ex) noexcept override {
-        finishErr("server handshake: " + ex.what().toStdString());
+        setError("server handshake: " + ex.what().toStdString());
     }
     void fizzHandshakeAttemptFallback(
         fizz::server::AttemptVersionFallback) noexcept override {
-        finishErr("server handshake: fallback requested");
+        setError("server handshake: fallback requested");
     }
 
     // ReadCallback
@@ -165,44 +176,59 @@ public:
     }
     void readDataAvailable(size_t len) noexcept override {
         readQueue_.postallocate(len);
-        while (readQueue_.chainLength() >= batchSize_ && remaining_ > 0) {
+        while (readQueue_.chainLength() >= batchSize_ && reads_remaining_ > 0) {
             auto data = readQueue_.split(batchSize_);
+            ++writes_in_flight_;
+            --reads_remaining_;
             server_->writeChain(this, std::move(data));
+        }
+        if (reads_remaining_ == 0 && !stopped_) {
+            stopped_ = true;
+            maybeFinish();
         }
     }
     void readEOF() noexcept override {
-        if (remaining_ > 0) finishErr("server: peer closed mid-stream");
+        if (reads_remaining_ > 0) {
+            setError("server: peer closed mid-stream");
+        } else if (!stopped_) {
+            stopped_ = true;
+            maybeFinish();
+        }
     }
     void readErr(const folly::AsyncSocketException& ex) noexcept override {
-        finishErr(std::string("server read: ") + ex.what());
+        setError(std::string("server read: ") + ex.what());
     }
 
     // WriteCallback
     void writeSuccess() noexcept override {
-        if (--remaining_ == 0) {
-            server_->setReadCB(nullptr);
-            server_->close();
-            finishOk();
-        }
+        --writes_in_flight_;
+        maybeFinish();
     }
     void writeErr(size_t, const folly::AsyncSocketException& ex) noexcept override {
-        finishErr(std::string("server write: ") + ex.what());
+        --writes_in_flight_;
+        setError(std::string("server write: ") + ex.what());
     }
 
 private:
-    void finishOk() {
-        if (!finished_.exchange(true)) {
+    void setError(std::string msg) {
+        if (!error_msg_) error_msg_ = std::move(msg);
+        stopped_ = true;
+        maybeFinish();
+    }
+    void maybeFinish() {
+        if (finished_) return;
+        if (!stopped_) return;
+        if (writes_in_flight_ > 0) return;
+        finished_ = true;
+        if (server_) {
+            server_->setReadCB(nullptr);
+            if (server_->good()) server_->close();
+        }
+        if (error_msg_) {
+            done_.setException(std::runtime_error(*error_msg_));
+        } else {
             done_.setValue();
-            scheduleSelfDelete();
         }
-    }
-    void finishErr(const std::string& msg) {
-        if (!finished_.exchange(true)) {
-            done_.setException(std::runtime_error(msg));
-            scheduleSelfDelete();
-        }
-    }
-    void scheduleSelfDelete() {
         // Defer to the next loop tick so we don't free ourselves from inside
         // a fizz/folly callback that's still walking our v-table.
         server_->getEventBase()->runInLoop([this] { delete this; });
@@ -210,10 +236,13 @@ private:
 
     fizz::server::AsyncFizzServer::UniquePtr server_;
     size_t batchSize_;
-    size_t remaining_;
+    size_t reads_remaining_;
+    size_t writes_in_flight_{0};
+    bool stopped_{false};
+    bool finished_{false};
+    std::optional<std::string> error_msg_;
     folly::Promise<folly::Unit> done_;
     folly::IOBufQueue readQueue_{folly::IOBufQueue::cacheChainLength()};
-    std::atomic<bool> finished_{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -240,7 +269,7 @@ public:
           ctx_(ctx),
           sni_(std::move(sni)),
           batchSize_(batchSize),
-          remaining_(rounds),
+          reads_remaining_(rounds),
           done_(std::move(done)) {
         sendBuf_.assign(batchSize_, 0x5A);
     }
@@ -266,25 +295,30 @@ public:
             const auto* peerDC = dynamic_cast<const fizz::extensions::PeerDelegatedCredential*>(
                 peerCert.get());
             if (!peerDC) {
-                finishErr("server did not present a delegated credential");
+                setError("server did not present a delegated credential");
                 return;
             }
             std::string err = verify_peer_dc(*ctx_, *peerDC);
             if (!err.empty()) {
                 client->closeNow();
-                finishErr(err);
+                setError(err);
                 return;
             }
             client_->setReadCB(this);
+            if (reads_remaining_ == 0) {
+                stopped_ = true;
+                maybeFinish();
+                return;
+            }
             sendOne();
         } catch (const std::exception& e) {
-            finishErr(std::string("client verify: ") + e.what());
+            setError(std::string("client verify: ") + e.what());
         }
     }
     void fizzHandshakeError(
         fizz::client::AsyncFizzClient*,
         folly::exception_wrapper ex) noexcept override {
-        finishErr("client handshake: " + ex.what().toStdString());
+        setError("client handshake: " + ex.what().toStdString());
     }
 
     // ReadCallback
@@ -295,50 +329,64 @@ public:
     }
     void readDataAvailable(size_t len) noexcept override {
         readQueue_.postallocate(len);
-        while (readQueue_.chainLength() >= batchSize_ && remaining_ > 0) {
+        while (readQueue_.chainLength() >= batchSize_ && reads_remaining_ > 0) {
             readQueue_.split(batchSize_);  // discard echoed bytes
-            if (--remaining_ == 0) {
-                client_->setReadCB(nullptr);
-                client_->close();
-                finishOk();
-                return;
+            --reads_remaining_;
+            if (reads_remaining_ == 0) {
+                stopped_ = true;
+                break;
             }
             sendOne();
         }
+        if (stopped_) maybeFinish();
     }
     void readEOF() noexcept override {
-        if (remaining_ > 0) finishErr("client: peer closed mid-stream");
+        if (reads_remaining_ > 0) {
+            setError("client: peer closed mid-stream");
+        } else if (!stopped_) {
+            stopped_ = true;
+            maybeFinish();
+        }
     }
     void readErr(const folly::AsyncSocketException& ex) noexcept override {
-        finishErr(std::string("client read: ") + ex.what());
+        setError(std::string("client read: ") + ex.what());
     }
 
     // WriteCallback
     void writeSuccess() noexcept override {
-        // Wait for echo via readDataAvailable.
+        --writes_in_flight_;
+        maybeFinish();
     }
     void writeErr(size_t, const folly::AsyncSocketException& ex) noexcept override {
-        finishErr(std::string("client write: ") + ex.what());
+        --writes_in_flight_;
+        setError(std::string("client write: ") + ex.what());
     }
 
 private:
     void sendOne() {
         auto buf = folly::IOBuf::copyBuffer(sendBuf_.data(), sendBuf_.size());
+        ++writes_in_flight_;
         client_->writeChain(this, std::move(buf));
     }
-    void finishOk() {
-        if (!finished_.exchange(true)) {
+    void setError(std::string msg) {
+        if (!error_msg_) error_msg_ = std::move(msg);
+        stopped_ = true;
+        maybeFinish();
+    }
+    void maybeFinish() {
+        if (finished_) return;
+        if (!stopped_) return;
+        if (writes_in_flight_ > 0) return;
+        finished_ = true;
+        if (client_) {
+            client_->setReadCB(nullptr);
+            if (client_->good()) client_->close();
+        }
+        if (error_msg_) {
+            done_.setException(std::runtime_error(*error_msg_));
+        } else {
             done_.setValue();
-            scheduleSelfDelete();
         }
-    }
-    void finishErr(const std::string& msg) {
-        if (!finished_.exchange(true)) {
-            done_.setException(std::runtime_error(msg));
-            scheduleSelfDelete();
-        }
-    }
-    void scheduleSelfDelete() {
         client_->getEventBase()->runInLoop([this] { delete this; });
     }
 
@@ -348,11 +396,14 @@ private:
     const FizzClientContext* ctx_;
     std::string sni_;
     size_t batchSize_;
-    size_t remaining_;
+    size_t reads_remaining_;
+    size_t writes_in_flight_{0};
+    bool stopped_{false};
+    bool finished_{false};
+    std::optional<std::string> error_msg_;
     folly::Promise<folly::Unit> done_;
     folly::IOBufQueue readQueue_{folly::IOBufQueue::cacheChainLength()};
     std::vector<uint8_t> sendBuf_;
-    std::atomic<bool> finished_{false};
 };
 
 // One EventBase + worker thread, owning a single connection. Mirrors the
