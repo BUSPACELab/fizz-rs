@@ -29,6 +29,7 @@
 #include <fizz/protocol/DefaultCertificateVerifier.h>
 #include <folly/io/async/AsyncServerSocket.h>
 #include <folly/io/async/AsyncSocket.h>
+#include <folly/io/async/DelayedDestruction.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/EventBaseManager.h>
 #include <folly/io/IOBufQueue.h>
@@ -129,12 +130,20 @@ int blocking_tcp_connect(uint16_t port) {
 
 // Session lifecycle: callbacks (read*, write*, handshake*) all fire on the
 // per-conn evb thread, so plain bools / counters are safe — no atomic needed.
-// We track reads_remaining_ and writes_in_flight_ separately and only delete
-// the session once both reach zero (or an error has stopped us AND no writes
-// are pending). This prevents the UAF that occurred when readEOF / read of
-// the last echo deleted the session before a queued writeSuccess fired.
+// We track reads_remaining_ and writes_in_flight_ separately and only stop
+// the session once both reach zero (or an error has set us into a stopped
+// state AND no writes are pending).
+//
+// Lifetime is managed via folly::DelayedDestruction — `destroy()` defers
+// actual deletion until every callback currently on the stack has unwound
+// (each callback opens with a DestructorGuard). This is the canonical folly
+// pattern for an object whose own callbacks may fire after a destroy request,
+// and it prevents the use-after-free that surfaced when a queued
+// `writeSuccess` ran on a session that had already been deleted via a
+// runInLoop on the same evb.
 class EchoServerSession final
-    : public fizz::server::AsyncFizzServer::HandshakeCallback,
+    : public folly::DelayedDestruction,
+      public fizz::server::AsyncFizzServer::HandshakeCallback,
       public folly::AsyncTransportWrapper::ReadCallback,
       public folly::AsyncTransportWrapper::WriteCallback {
 public:
@@ -152,6 +161,7 @@ public:
 
     // HandshakeCallback
     void fizzHandshakeSuccess(fizz::server::AsyncFizzServer*) noexcept override {
+        DestructorGuard dg(this);
         server_->setReadCB(this);
         if (reads_remaining_ == 0) {
             stopped_ = true;
@@ -161,10 +171,12 @@ public:
     void fizzHandshakeError(
         fizz::server::AsyncFizzServer*,
         folly::exception_wrapper ex) noexcept override {
+        DestructorGuard dg(this);
         setError("server handshake: " + ex.what().toStdString());
     }
     void fizzHandshakeAttemptFallback(
         fizz::server::AttemptVersionFallback) noexcept override {
+        DestructorGuard dg(this);
         setError("server handshake: fallback requested");
     }
 
@@ -175,6 +187,7 @@ public:
         *len = p.second;
     }
     void readDataAvailable(size_t len) noexcept override {
+        DestructorGuard dg(this);
         readQueue_.postallocate(len);
         while (readQueue_.chainLength() >= batchSize_ && reads_remaining_ > 0) {
             auto data = readQueue_.split(batchSize_);
@@ -188,6 +201,7 @@ public:
         }
     }
     void readEOF() noexcept override {
+        DestructorGuard dg(this);
         if (reads_remaining_ > 0) {
             setError("server: peer closed mid-stream");
         } else if (!stopped_) {
@@ -196,18 +210,26 @@ public:
         }
     }
     void readErr(const folly::AsyncSocketException& ex) noexcept override {
+        DestructorGuard dg(this);
         setError(std::string("server read: ") + ex.what());
     }
 
     // WriteCallback
     void writeSuccess() noexcept override {
+        DestructorGuard dg(this);
         --writes_in_flight_;
         maybeFinish();
     }
     void writeErr(size_t, const folly::AsyncSocketException& ex) noexcept override {
+        DestructorGuard dg(this);
         --writes_in_flight_;
         setError(std::string("server write: ") + ex.what());
     }
+
+protected:
+    // DelayedDestruction requires destructor to be non-public; clients call
+    // destroy() (here, indirectly via maybeFinish).
+    ~EchoServerSession() override = default;
 
 private:
     void setError(std::string msg) {
@@ -229,9 +251,9 @@ private:
         } else {
             done_.setValue();
         }
-        // Defer to the next loop tick so we don't free ourselves from inside
-        // a fizz/folly callback that's still walking our v-table.
-        server_->getEventBase()->runInLoop([this] { delete this; });
+        // DelayedDestruction: actual delete happens after every active
+        // DestructorGuard on this object goes out of scope.
+        destroy();
     }
 
     fizz::server::AsyncFizzServer::UniquePtr server_;
@@ -250,7 +272,8 @@ private:
 // ---------------------------------------------------------------------------
 
 class EchoClientSession final
-    : public fizz::client::AsyncFizzClient::HandshakeCallback,
+    : public folly::DelayedDestruction,
+      public fizz::client::AsyncFizzClient::HandshakeCallback,
       public folly::AsyncTransportWrapper::ReadCallback,
       public folly::AsyncTransportWrapper::WriteCallback {
 public:
@@ -289,6 +312,7 @@ public:
 
     // HandshakeCallback
     void fizzHandshakeSuccess(fizz::client::AsyncFizzClient* client) noexcept override {
+        DestructorGuard dg(this);
         try {
             const auto& state = client->getState();
             auto peerCert = state.serverCert();
@@ -318,6 +342,7 @@ public:
     void fizzHandshakeError(
         fizz::client::AsyncFizzClient*,
         folly::exception_wrapper ex) noexcept override {
+        DestructorGuard dg(this);
         setError("client handshake: " + ex.what().toStdString());
     }
 
@@ -328,6 +353,7 @@ public:
         *len = p.second;
     }
     void readDataAvailable(size_t len) noexcept override {
+        DestructorGuard dg(this);
         readQueue_.postallocate(len);
         while (readQueue_.chainLength() >= batchSize_ && reads_remaining_ > 0) {
             readQueue_.split(batchSize_);  // discard echoed bytes
@@ -341,6 +367,7 @@ public:
         if (stopped_) maybeFinish();
     }
     void readEOF() noexcept override {
+        DestructorGuard dg(this);
         if (reads_remaining_ > 0) {
             setError("client: peer closed mid-stream");
         } else if (!stopped_) {
@@ -349,18 +376,24 @@ public:
         }
     }
     void readErr(const folly::AsyncSocketException& ex) noexcept override {
+        DestructorGuard dg(this);
         setError(std::string("client read: ") + ex.what());
     }
 
     // WriteCallback
     void writeSuccess() noexcept override {
+        DestructorGuard dg(this);
         --writes_in_flight_;
         maybeFinish();
     }
     void writeErr(size_t, const folly::AsyncSocketException& ex) noexcept override {
+        DestructorGuard dg(this);
         --writes_in_flight_;
         setError(std::string("client write: ") + ex.what());
     }
+
+protected:
+    ~EchoClientSession() override = default;
 
 private:
     void sendOne() {
@@ -387,7 +420,9 @@ private:
         } else {
             done_.setValue();
         }
-        client_->getEventBase()->runInLoop([this] { delete this; });
+        // DelayedDestruction: actual delete happens after every active
+        // DestructorGuard on this object goes out of scope.
+        destroy();
     }
 
     fizz::client::AsyncFizzClient::UniquePtr client_;
