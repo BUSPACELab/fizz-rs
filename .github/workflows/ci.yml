@@ -46,6 +46,28 @@ jobs:
           # Native deps live under target/; default prefixes are usually enough.
           shared-key: fizz-rs
 
+      # The dominant build cost is `getdeps build fizz` (folly + fast_float +
+      # oqs + ...). Its install tree lives under
+      # `target/debug/build/fizz_rs-*/out/fizz-install/` for this workflow
+      # (ci.yml builds in debug profile via `cargo test` / `cargo build`).
+      # Swatinem's cache may prune it, so we restore it explicitly here keyed
+      # on the third_party/fizz submodule SHA. Separate `-debug-` suffix so it
+      # doesn't collide with benchmark.yml's release cache.
+      - name: Compute fizz submodule SHA
+        id: fizz-sha
+        run: |
+          SHA=$(git -C third_party/fizz rev-parse HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "fizz submodule SHA: $SHA"
+
+      - name: Cache fizz/folly install tree
+        uses: actions/cache@v4
+        with:
+          path: target/debug/build/fizz_rs-*/out/fizz-install
+          key: fizz-install-${{ runner.os }}-debug-${{ steps.fizz-sha.outputs.sha }}
+          restore-keys: |
+            fizz-install-${{ runner.os }}-debug-
+
       # One compile pass: library + integration tests (avoids redundant `cargo build`).
       - name: Build and test
         env:
