@@ -41,6 +41,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -119,6 +120,14 @@ int blocking_tcp_connect(uint16_t port) {
     if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         ::close(fd);
         throw std::runtime_error("cpp_bench: connect()");
+    }
+    // Disable Nagle to match the Rust backends — keeps the Tahini-vs-fizz_cpp
+    // comparison apples-to-apples (loopback Nagle adds ~40 ms / round-trip and
+    // dominates the bench at low pairs counts).
+    int one = 1;
+    if (::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) < 0) {
+        ::close(fd);
+        throw std::runtime_error("cpp_bench: setsockopt(TCP_NODELAY)");
     }
     return fd;
 }
@@ -492,6 +501,10 @@ public:
             evbPtr->runInEventBaseThread([this, fd, evbPtr] {
                 try {
                     auto socket = folly::AsyncSocket::newSocket(evbPtr, fd);
+                    // Match the Rust backends: TCP_NODELAY on every conn so
+                    // loopback Nagle doesn't dominate. AsyncServerSocket does
+                    // not propagate this from the listener; set per-conn.
+                    socket->setNoDelay(true);
                     auto fizzServer = fizz::server::AsyncFizzServer::UniquePtr(
                         new fizz::server::AsyncFizzServer(
                             std::move(socket), serverCtx_));
@@ -623,6 +636,10 @@ uint64_t run_fizz_cpp_bench(
             try {
                 folly::NetworkSocket netSock(tcpFd);
                 auto socket = folly::AsyncSocket::newSocket(evbPtr, netSock);
+                // TCP_NODELAY was already set on the bare fd in
+                // blocking_tcp_connect, but reassert here in case folly's
+                // AsyncSocket clears any options on attach.
+                socket->setNoDelay(true);
                 auto dcExt = std::make_shared<
                     fizz::extensions::DelegatedCredentialClientExtension>(
                     std::vector<fizz::SignatureScheme>{

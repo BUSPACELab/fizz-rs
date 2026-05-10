@@ -170,6 +170,19 @@ fn bind_listener() -> Result<(std::net::SocketAddr, std::net::TcpListener)> {
     Ok((addr, listener))
 }
 
+// Disable Nagle's algorithm. Without this, on loopback the kernel coalesces
+// small writes (e.g. TLS record headers) and adds up to ~40 ms of latency per
+// round-trip, which dominates the benchmark — especially at low pairs counts
+// where there's no concurrent traffic to keep the pipe full. Applied to every
+// backend (tcp / rustls / fizz / fizz_cpp) so the comparison stays
+// apples-to-apples; for the fizz Rust binding the option persists at the
+// socket level even after `take_raw_fd` hands the fd to C++.
+fn nodelay(stream: &TcpStream) -> Result<()> {
+    stream
+        .set_nodelay(true)
+        .context("set TCP_NODELAY")
+}
+
 fn run_tcp(
     client_rt: &Runtime,
     server_rt: &Runtime,
@@ -183,6 +196,7 @@ fn run_tcp(
         let mut set = JoinSet::new();
         for _ in 0..pairs {
             let (stream, _) = listener.accept().await?;
+            nodelay(&stream)?;
             set.spawn(async move { echo_serve(stream, batch_size, rounds).await });
         }
         while let Some(r) = set.join_next().await {
@@ -196,6 +210,7 @@ fn run_tcp(
         for _ in 0..pairs {
             set.spawn(async move {
                 let stream = TcpStream::connect(addr).await?;
+                nodelay(&stream)?;
                 echo_client(stream, batch_size, rounds).await
             });
         }
@@ -231,6 +246,7 @@ fn run_rustls(
         let mut set = JoinSet::new();
         for _ in 0..pairs {
             let (stream, _) = listener.accept().await?;
+            nodelay(&stream)?;
             let acceptor = acceptor.clone();
             set.spawn(async move {
                 let tls = acceptor.accept(stream).await?;
@@ -250,6 +266,7 @@ fn run_rustls(
             let dns = dns.clone();
             set.spawn(async move {
                 let tcp = TcpStream::connect(addr).await?;
+                nodelay(&tcp)?;
                 let tls = connector.connect(dns, tcp).await?;
                 echo_client(tls, batch_size, rounds).await
             });
@@ -281,6 +298,7 @@ fn run_fizz(
         let mut set = JoinSet::new();
         for _ in 0..pairs {
             let (stream, _) = listener.accept().await?;
+            nodelay(&stream)?;
             let ctx = server_ctx.clone();
             set.spawn(async move {
                 let tls = ctx.accept_from_stream(stream).await?;
@@ -299,6 +317,7 @@ fn run_fizz(
             let ctx = client_ctx.clone();
             set.spawn(async move {
                 let tcp = TcpStream::connect(addr).await?;
+                nodelay(&tcp)?;
                 let tls = ctx.connect(tcp, "localhost").await?;
                 echo_client(tls, batch_size, rounds).await
             });
