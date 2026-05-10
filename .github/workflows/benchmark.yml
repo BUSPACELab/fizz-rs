@@ -123,27 +123,33 @@ jobs:
           echo "backend,pairs,client_workers,server_workers,max_blocking_threads,batch_size,rounds,wall_ms,total_bytes,mb_per_s,error" > "$OUT"
           IFS=',' read -ra NS <<< "${{ github.event.inputs.pairs_sweep }}"
           bench_status=0
+          # Don't `set -e` so a single crashing invocation doesn't kill the
+          # whole step — we want partial CSV data and a chance for the dump
+          # capture step to fire.
+          set +e
           for N in "${NS[@]}"; do
             for BACKEND in tcp rustls fizz fizz-cpp; do
               echo ">>> N=$N backend=$BACKEND" >&2
-              if ! ./target/release/tls_bench_ablation \
-                    --backend "$BACKEND" --pairs "$N" \
-                    --batch-size ${{ github.event.inputs.batch_size }} \
-                    --rounds ${{ github.event.inputs.rounds }} \
-                    --warmup ${{ github.event.inputs.warmup }} \
-                    --runs ${{ github.event.inputs.runs }} \
-                    >> "$OUT"; then
-                rc=$?
+              ./target/release/tls_bench_ablation \
+                --backend "$BACKEND" --pairs "$N" \
+                --batch-size ${{ github.event.inputs.batch_size }} \
+                --rounds ${{ github.event.inputs.rounds }} \
+                --warmup ${{ github.event.inputs.warmup }} \
+                --runs ${{ github.event.inputs.runs }} \
+                >> "$OUT"
+              rc=$?
+              if [ "$rc" -ne 0 ]; then
                 echo "!!! crashed: N=$N backend=$BACKEND exit=$rc" >&2
                 bench_status=$rc
-                # Continue so we get every backend's crash recorded, but stop
-                # after the first crash for THIS N to avoid corrupting state.
+                # Stop the whole sweep on first crash so the core dump on
+                # disk corresponds to the (backend, N) we just printed.
                 break 2
               fi
             done
           done
           echo "--- $OUT ---"
           cat "$OUT"
+          # Exit non-zero on any crash so the on-failure backtrace step fires.
           exit $bench_status
 
       - name: Capture backtrace from core dump (on failure)

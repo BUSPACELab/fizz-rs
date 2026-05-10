@@ -251,18 +251,30 @@ private:
         if (!stopped_) return;
         if (writes_in_flight_ > 0) return;
         finished_ = true;
-        if (server_) {
-            server_->setReadCB(nullptr);
-            if (server_->good()) server_->close();
-        }
-        if (error_msg_) {
-            done_.setException(std::runtime_error(*error_msg_));
-        } else {
-            done_.setValue();
-        }
-        // DelayedDestruction: actual delete happens after every active
-        // DestructorGuard on this object goes out of scope.
-        destroy();
+        // Defer transport teardown AND object destruction until the current
+        // callback's call stack has fully unwound. Calling destroy() (or any
+        // of these synchronously) from inside writeSuccess / readEOF leaves
+        // us re-entering the AsyncSocket / AsyncFizzServer frames above us
+        // after we've torn them down — which crashes intermittently on Linux
+        // at high N depending on epoll's callback scheduling.
+        //
+        // runInLoop runs the closure when the current event-loop iteration
+        // returns to the loop, by which point every folly frame above us
+        // has unwound. Promise resolution is also deferred so the outer
+        // future continuation doesn't race with our cleanup.
+        auto* evb = server_->getEventBase();
+        evb->runInLoop([this]() {
+            if (server_) {
+                server_->setReadCB(nullptr);
+                if (server_->good()) server_->close();
+            }
+            if (error_msg_) {
+                done_.setException(std::runtime_error(*error_msg_));
+            } else {
+                done_.setValue();
+            }
+            destroy();
+        });
     }
 
     fizz::server::AsyncFizzServer::UniquePtr server_;
@@ -420,18 +432,22 @@ private:
         if (!stopped_) return;
         if (writes_in_flight_ > 0) return;
         finished_ = true;
-        if (client_) {
-            client_->setReadCB(nullptr);
-            if (client_->good()) client_->close();
-        }
-        if (error_msg_) {
-            done_.setException(std::runtime_error(*error_msg_));
-        } else {
-            done_.setValue();
-        }
-        // DelayedDestruction: actual delete happens after every active
-        // DestructorGuard on this object goes out of scope.
-        destroy();
+        // See EchoServerSession::maybeFinish for rationale — defer transport
+        // teardown, promise resolution, and self-destruction until the
+        // callback frame above us has unwound.
+        auto* evb = client_->getEventBase();
+        evb->runInLoop([this]() {
+            if (client_) {
+                client_->setReadCB(nullptr);
+                if (client_->good()) client_->close();
+            }
+            if (error_msg_) {
+                done_.setException(std::runtime_error(*error_msg_));
+            } else {
+                done_.setValue();
+            }
+            destroy();
+        });
     }
 
     fizz::client::AsyncFizzClient::UniquePtr client_;
