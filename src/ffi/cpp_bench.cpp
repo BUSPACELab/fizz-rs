@@ -36,6 +36,7 @@
 #include <folly/futures/Future.h>
 #include <folly/futures/Promise.h>
 #include <folly/ssl/OpenSSLCertUtils.h>
+#include <folly/synchronization/Baton.h>
 
 #include <openssl/x509.h>
 
@@ -568,6 +569,20 @@ public:
         }
     }
 
+    // Fired by AsyncServerSocket after stopAccepting completes. We use this
+    // to gate `delete acceptor` in the teardown path: stopAccepting() queues
+    // a deferred call into us, so deleting the acceptor before this fires is
+    // a use-after-free that crashes intermittently in
+    // AsyncServerSocket.cpp:78 (`callback->acceptStopped()`). Confirmed by
+    // CI core dump.
+    void acceptStopped() noexcept override {
+        stoppedBaton_.post();
+    }
+
+    void waitForStopped() {
+        stoppedBaton_.wait();
+    }
+
 private:
     std::shared_ptr<fizz::server::FizzServerContext> serverCtx_;
     size_t batchSize_;
@@ -578,6 +593,7 @@ private:
     std::mutex* perConnMutex_;
     std::atomic<size_t> completed_{0};
     std::atomic<bool> fired_{false};
+    folly::Baton<> stoppedBaton_;
 };
 
 }  // namespace
@@ -709,6 +725,11 @@ uint64_t run_fizz_cpp_bench(
         listener->stopAccepting();
         listener.reset();
     });
+    // stopAccepting() defers callback->acceptStopped() into a runInEventBaseThread
+    // task on the accept evb. Deleting the acceptor before that task fires is a
+    // use-after-free (CI core dump confirmed crash at AsyncServerSocket.cpp:78).
+    // Wait for the baton posted from acceptStopped() before deleting.
+    acceptor->waitForStopped();
     delete acceptor;
 
     acceptEvb.terminateLoopSoon();
