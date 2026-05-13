@@ -206,6 +206,13 @@ pub mod ffi {
             delegated_cred: &ServiceCredential,
         ) -> Result<UniquePtr<FizzServerContext>>;
 
+        /// Create a new server TLS context that serves the parent certificate
+        /// directly, without minting a delegated credential. Used as the
+        /// "regular TLS" baseline for DC-overhead benchmarks.
+        fn new_server_tls_context_no_dc(
+            parent_cert: &CertificateData,
+        ) -> Result<UniquePtr<FizzServerContext>>;
+
         /// Set ALPN protocols for server context
         fn server_context_set_alpn_protocols(
             ctx: Pin<&mut FizzServerContext>,
@@ -263,6 +270,13 @@ pub mod ffi {
         /// Create a new client TLS context with verification info
         fn new_client_tls_context(
             verification_info: &VerificationInfo,
+            ca_cert_path: &str,
+        ) -> Result<UniquePtr<FizzClientContext>>;
+
+        /// Create a new client TLS context that verifies the server's
+        /// certificate chain directly, without advertising or validating a
+        /// delegated credential. Used as the "regular TLS" baseline.
+        fn new_client_tls_context_no_dc(
             ca_cert_path: &str,
         ) -> Result<UniquePtr<FizzClientContext>>;
 

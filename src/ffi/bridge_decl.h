@@ -77,6 +77,8 @@ VerificationInfo verification_info_from_json(rust::Str json);
 std::unique_ptr<FizzServerContext> new_server_tls_context(
     const CertificatePublic& parent_cert,
     const ServiceCredential& delegated_cred);
+std::unique_ptr<FizzServerContext> new_server_tls_context_no_dc(
+    const CertificateData& parent_cert);
 void server_context_set_alpn_protocols(
     FizzServerContext& ctx,
     rust::Vec<rust::String> protocols);
@@ -101,6 +103,8 @@ ReadOutcome server_connection_read_or_status(
 // Client TLS FFI function declarations
 std::unique_ptr<FizzClientContext> new_client_tls_context(
     const VerificationInfo& verification_info,
+    rust::Str ca_cert_path);
+std::unique_ptr<FizzClientContext> new_client_tls_context_no_dc(
     rust::Str ca_cert_path);
 void client_context_set_alpn_protocols(
     FizzClientContext& ctx,

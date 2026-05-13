@@ -9,14 +9,19 @@
 #include "ffi/server_tls_ffi.h"
 #include "fizz_rs/src/bridge.rs.h"
 #include <fizz/server/AsyncFizzServer.h>
+#include <fizz/server/DefaultCertManager.h>
 #include <fizz/server/TicketTypes.h>
 #include <fizz/server/AeadTicketCipher.h>
+#include <fizz/backend/openssl/certificate/OpenSSLSelfCertImpl.h>
 #include <fizz/extensions/delegatedcred/DelegatedCredentialFactory.h>
 #include <fizz/extensions/delegatedcred/DelegatedCredentialUtils.h>
 #include <fizz/extensions/delegatedcred/Serialization.h>
 #include <folly/io/async/AsyncSocket.h>
 #include <folly/io/async/EventBaseManager.h>
 #include <folly/io/IOBufQueue.h>
+#include <folly/ssl/OpenSSLPtrTypes.h>
+#include <openssl/bio.h>
+#include <openssl/pem.h>
 #include <stdexcept>
 #include <chrono>
 #include <iostream>
@@ -111,6 +116,74 @@ std::unique_ptr<FizzServerContext> new_server_tls_context(
         return context;
     } catch (const std::exception& e) {
         throw std::runtime_error("Failed to create server TLS context: " + std::string(e.what()));
+    }
+}
+
+std::unique_ptr<FizzServerContext> new_server_tls_context_no_dc(
+    const CertificateData& parent_cert) {
+    try {
+        auto context = std::make_unique<FizzServerContext>();
+
+        context->ctx = std::make_shared<fizz::server::FizzServerContext>();
+
+        // Parse parent certificate and private key from PEM.
+        std::string certPemStr(parent_cert.cert_pem);
+        folly::ssl::BioUniquePtr certBio(
+            BIO_new_mem_buf(certPemStr.data(), certPemStr.size()));
+        X509* certRaw = PEM_read_bio_X509(certBio.get(), nullptr, nullptr, nullptr);
+        if (!certRaw) {
+            throw std::runtime_error("Failed to parse parent certificate PEM");
+        }
+        folly::ssl::X509UniquePtr certPtr(certRaw);
+
+        std::string keyPemStr(parent_cert.key_pem);
+        folly::ssl::BioUniquePtr keyBio(
+            BIO_new_mem_buf(keyPemStr.data(), keyPemStr.size()));
+        EVP_PKEY* keyRaw = PEM_read_bio_PrivateKey(
+            keyBio.get(), nullptr, nullptr, nullptr);
+        if (!keyRaw) {
+            throw std::runtime_error("Failed to parse parent private key PEM");
+        }
+        folly::ssl::EvpPkeyUniquePtr keyPtr(keyRaw);
+
+        std::vector<folly::ssl::X509UniquePtr> certs;
+        certs.push_back(std::move(certPtr));
+        auto selfCert = std::make_shared<
+            fizz::openssl::OpenSSLSelfCertImpl<fizz::openssl::KeyType::P256>>(
+            std::move(keyPtr), std::move(certs));
+
+        auto certManager = std::make_unique<fizz::server::DefaultCertManager>();
+        certManager->addCertAndSetDefault(std::move(selfCert));
+        context->ctx->setCertManager(std::move(certManager));
+
+        context->ticketCipher = createTicketCipher();
+        context->ctx->setTicketCipher(context->ticketCipher);
+
+        context->ctx->setSupportedVersions({fizz::ProtocolVersion::tls_1_3});
+        context->ctx->setSupportedCiphers({{
+            fizz::CipherSuite::TLS_AES_128_GCM_SHA256,
+            fizz::CipherSuite::TLS_AES_256_GCM_SHA384,
+            fizz::CipherSuite::TLS_CHACHA20_POLY1305_SHA256
+        }});
+        context->ctx->setSupportedSigSchemes({{
+            fizz::SignatureScheme::ecdsa_secp256r1_sha256,
+            fizz::SignatureScheme::ecdsa_secp384r1_sha384,
+            fizz::SignatureScheme::ecdsa_secp521r1_sha512,
+            fizz::SignatureScheme::rsa_pss_sha256
+        }});
+        context->ctx->setSupportedGroups({{
+            fizz::NamedGroup::secp256r1,
+            fizz::NamedGroup::secp384r1,
+            fizz::NamedGroup::secp521r1,
+            fizz::NamedGroup::x25519
+        }});
+
+        context->alpnProtocols = {};
+
+        return context;
+    } catch (const std::exception& e) {
+        throw std::runtime_error(
+            "Failed to create non-DC server TLS context: " + std::string(e.what()));
     }
 }
 

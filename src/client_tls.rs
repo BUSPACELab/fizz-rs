@@ -57,6 +57,14 @@ impl ClientTlsContext {
         Ok(Self { inner })
     }
 
+    /// Create a client TLS context that does **not** advertise or verify a
+    /// delegated credential. Used as the "regular TLS" baseline for
+    /// DC-overhead benchmarks.
+    pub fn new_no_dc(ca_cert_path: &str) -> Result<Self> {
+        let inner = ffi::new_client_tls_context_no_dc(ca_cert_path)?;
+        Ok(Self { inner })
+    }
+
     /// Set ALPN protocols to negotiate
     ///
     /// # Example

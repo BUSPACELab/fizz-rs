@@ -4,7 +4,7 @@
 //! delegated credentials and accepting TLS connections.
 
 use crate::bridge::ffi;
-use crate::certificates::CertificatePublic;
+use crate::certificates::{Certificate, CertificatePublic};
 use crate::credentials::DelegatedCredentialData;
 use crate::error::{FizzError, Result};
 use crate::io::{take_raw_fd, SendableRawPtr};
@@ -59,6 +59,18 @@ impl ServerTlsContext {
     /// ```
     pub fn new(cert: CertificatePublic, delegated_cred: DelegatedCredentialData) -> Result<Self> {
         let inner = ffi::new_server_tls_context(cert.as_inner(), &delegated_cred.inner)?;
+        Ok(Self { inner })
+    }
+
+    /// Create a server TLS context that serves the parent certificate
+    /// directly, with no delegated credential. This is the "regular TLS"
+    /// baseline path used for measuring delegated-credential overhead.
+    ///
+    /// Unlike [`Self::new`], this constructor requires the parent private key
+    /// (carried by [`Certificate`]) because the server itself signs the
+    /// handshake.
+    pub fn new_no_dc(cert: Certificate) -> Result<Self> {
+        let inner = ffi::new_server_tls_context_no_dc(cert.as_inner())?;
         Ok(Self { inner })
     }
 

@@ -189,6 +189,7 @@ std::unique_ptr<FizzClientContext> new_client_tls_context(
         auto context = std::make_unique<FizzClientContext>();
 
         // Extract and store verification info fields as native C++ types
+        context->dcEnabled = true;
         context->serviceName = std::string(verification_info.service_name);
         context->validTime = verification_info.valid_time;
         context->expectedVerifyScheme = verification_info.expected_verify_scheme;
@@ -244,6 +245,49 @@ std::unique_ptr<FizzClientContext> new_client_tls_context(
     }
 }
 
+std::unique_ptr<FizzClientContext> new_client_tls_context_no_dc(
+    rust::Str ca_cert_path) {
+    try {
+        auto context = std::make_unique<FizzClientContext>();
+
+        context->dcEnabled = false;
+        // The DC-specific verification fields are left default-initialised on
+        // purpose; the handshake path skips them when dcEnabled is false.
+        context->caCertPath = std::string(ca_cert_path);
+
+        // Create Fizz client context with its default factory (no
+        // DelegatedCredentialFactory).
+        context->ctx = std::make_shared<fizz::client::FizzClientContext>();
+
+        context->ctx->setSupportedVersions({fizz::ProtocolVersion::tls_1_3});
+        context->ctx->setSupportedCiphers({{
+            fizz::CipherSuite::TLS_AES_128_GCM_SHA256,
+            fizz::CipherSuite::TLS_AES_256_GCM_SHA384,
+            fizz::CipherSuite::TLS_CHACHA20_POLY1305_SHA256
+        }});
+        context->ctx->setSupportedSigSchemes({{
+            fizz::SignatureScheme::ecdsa_secp256r1_sha256,
+            fizz::SignatureScheme::ecdsa_secp384r1_sha384,
+            fizz::SignatureScheme::ecdsa_secp521r1_sha512,
+            fizz::SignatureScheme::rsa_pss_sha256
+        }});
+        context->ctx->setSupportedGroups({{
+            fizz::NamedGroup::secp256r1,
+            fizz::NamedGroup::secp384r1,
+            fizz::NamedGroup::secp521r1,
+            fizz::NamedGroup::x25519
+        }});
+
+        context->alpnProtocols = {};
+        context->sniHostname = "";
+
+        return context;
+    } catch (const std::exception& e) {
+        throw std::runtime_error(
+            "Failed to create non-DC client TLS context: " + std::string(e.what()));
+    }
+}
+
 void client_context_set_alpn_protocols(
     FizzClientContext& ctx,
     rust::Vec<rust::String> protocols) {
@@ -295,37 +339,46 @@ std::unique_ptr<FizzClientConnection> client_connect(
         conn->caCertPath = ctx.caCertPath;
         conn->verifier = createCertificateVerifier(ctx.caCertPath);
 
-        // CRITICAL: Create delegated credential extension with supported signature schemes
-        // This advertises DC support to the server in ClientHello
-        std::vector<fizz::SignatureScheme> dcSigSchemes = {
-            fizz::SignatureScheme::ecdsa_secp256r1_sha256,
-            fizz::SignatureScheme::ecdsa_secp384r1_sha384,
-            fizz::SignatureScheme::ecdsa_secp521r1_sha512,
-            fizz::SignatureScheme::rsa_pss_sha256
-        };
-        conn->dcExtension = std::make_shared<fizz::extensions::DelegatedCredentialClientExtension>(
-            dcSigSchemes);
+        conn->dcEnabled = ctx.dcEnabled;
         conn->bytesRead = 0;
 
-        conn->expectedServiceName = ctx.serviceName;
-        conn->expectedValidTime = ctx.validTime;
-        conn->expectedVerifyScheme = ctx.expectedVerifyScheme;
-        conn->expectedPublicKeyDerHex = ctx.publicKeyDer;
-        conn->expectedExpiresAt = ctx.expiresAt;
+        if (ctx.dcEnabled) {
+            // CRITICAL: Create delegated credential extension with supported signature schemes
+            // This advertises DC support to the server in ClientHello
+            std::vector<fizz::SignatureScheme> dcSigSchemes = {
+                fizz::SignatureScheme::ecdsa_secp256r1_sha256,
+                fizz::SignatureScheme::ecdsa_secp384r1_sha384,
+                fizz::SignatureScheme::ecdsa_secp521r1_sha512,
+                fizz::SignatureScheme::rsa_pss_sha256
+            };
+            conn->dcExtension = std::make_shared<fizz::extensions::DelegatedCredentialClientExtension>(
+                dcSigSchemes);
+
+            conn->expectedServiceName = ctx.serviceName;
+            conn->expectedValidTime = ctx.validTime;
+            conn->expectedVerifyScheme = ctx.expectedVerifyScheme;
+            conn->expectedPublicKeyDerHex = ctx.publicKeyDer;
+            conn->expectedExpiresAt = ctx.expiresAt;
+        }
 
         // Create AsyncSocket from file descriptor
         // Note: AsyncSocket takes ownership of the FD
         folly::NetworkSocket networkSocket(fd);
         auto socket = folly::AsyncSocket::newSocket(conn->evb.get(), networkSocket);
 
-        // Create AsyncFizzClient with the socket, context, and DC extension
-        auto fizzClient = fizz::client::AsyncFizzClient::UniquePtr(
-            new fizz::client::AsyncFizzClient(
-                std::move(socket),
-                ctx.ctx,
-                conn->dcExtension  // Pass DC extension to enable delegated credentials
-            )
-        );
+        // Create AsyncFizzClient. Pass the DC ClientHello extension only when
+        // running in delegated-credential mode; in plain TLS mode we leave
+        // the extension argument as the default no-op.
+        auto fizzClient = ctx.dcEnabled
+            ? fizz::client::AsyncFizzClient::UniquePtr(
+                new fizz::client::AsyncFizzClient(
+                    std::move(socket),
+                    ctx.ctx,
+                    conn->dcExtension))
+            : fizz::client::AsyncFizzClient::UniquePtr(
+                new fizz::client::AsyncFizzClient(
+                    std::move(socket),
+                    ctx.ctx));
 
         // Store SNI hostname for later use during handshake
         std::string sniHostname = std::string(hostname);
@@ -388,27 +441,29 @@ void client_connection_handshake(FizzClientConnection& conn) {
                         return;
                     }
 
-                    const auto* peerDC =
-                        dynamic_cast<const fizz::extensions::PeerDelegatedCredential*>(
-                            serverCert.get());
-                    if (!peerDC) {
-                        error_ = "Server did not present a delegated credential certificate";
-                        return;
-                    }
+                    if (conn_->dcEnabled) {
+                        const auto* peerDC =
+                            dynamic_cast<const fizz::extensions::PeerDelegatedCredential*>(
+                                serverCert.get());
+                        if (!peerDC) {
+                            error_ = "Server did not present a delegated credential certificate";
+                            return;
+                        }
 
-                    std::string mismatch =
-                        verifyVerificationInfoAgainstPeerDelegatedCredential(*conn_, *peerDC);
-                    if (!mismatch.empty()) {
-                        error_ = std::move(mismatch);
-                        client->closeNow();
-                        return;
+                        std::string mismatch =
+                            verifyVerificationInfoAgainstPeerDelegatedCredential(*conn_, *peerDC);
+                        if (!mismatch.empty()) {
+                            error_ = std::move(mismatch);
+                            client->closeNow();
+                            return;
+                        }
                     }
 
                     peerCert_ = "[Certificate extracted successfully]";
                     client->setReadCB(conn_);
                     complete_ = true;
                 } catch (const std::exception& e) {
-                    error_ = std::string("Failed to verify delegated credential: ") + e.what();
+                    error_ = std::string("Failed to verify peer certificate: ") + e.what();
                 }
             }
 
@@ -515,23 +570,25 @@ void client_connection_handshake_async(
                     return;
                 }
 
-                const auto* peerDC =
-                    dynamic_cast<const fizz::extensions::PeerDelegatedCredential*>(
-                        serverCert.get());
-                if (!peerDC) {
-                    handle_io_result(
-                        std::move(context_), 0,
-                        rust::String("Server did not present a delegated credential certificate"));
-                    return;
-                }
+                if (conn_->dcEnabled) {
+                    const auto* peerDC =
+                        dynamic_cast<const fizz::extensions::PeerDelegatedCredential*>(
+                            serverCert.get());
+                    if (!peerDC) {
+                        handle_io_result(
+                            std::move(context_), 0,
+                            rust::String("Server did not present a delegated credential certificate"));
+                        return;
+                    }
 
-                std::string mismatch =
-                    verifyVerificationInfoAgainstPeerDelegatedCredential(*conn_, *peerDC);
-                if (!mismatch.empty()) {
-                    client->closeNow();
-                    handle_io_result(
-                        std::move(context_), 0, rust::String(mismatch));
-                    return;
+                    std::string mismatch =
+                        verifyVerificationInfoAgainstPeerDelegatedCredential(*conn_, *peerDC);
+                    if (!mismatch.empty()) {
+                        client->closeNow();
+                        handle_io_result(
+                            std::move(context_), 0, rust::String(mismatch));
+                        return;
+                    }
                 }
 
                 conn_->peerCertPem = "[Certificate extracted successfully]";
@@ -542,7 +599,7 @@ void client_connection_handshake_async(
                 handle_io_result(
                     std::move(context_), 0,
                     rust::String(
-                        std::string("Failed to verify delegated credential: ") +
+                        std::string("Failed to verify peer certificate: ") +
                         e.what()));
             }
         }

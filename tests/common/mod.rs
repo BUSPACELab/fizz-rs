@@ -59,3 +59,10 @@ pub fn load_parent_generator() -> Result<CredentialGenerator, String> {
     let (cert, _) = load_fixture_certificate()?;
     CredentialGenerator::new(cert).map_err(|e| e.to_string())
 }
+
+/// Materials for the non-DC (plain TLS) path: the full parent [`Certificate`]
+/// (server uses it directly to sign the handshake) and the parent cert path
+/// (acts as the CA the client trusts).
+pub fn load_no_dc_materials() -> Result<(Certificate, PathBuf), String> {
+    load_fixture_certificate()
+}

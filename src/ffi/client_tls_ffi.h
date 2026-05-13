@@ -33,7 +33,8 @@ struct ReadWaker;
 // Full definition is required for CXX UniquePtr operations
 struct FizzClientContext {
     std::shared_ptr<fizz::client::FizzClientContext> ctx;
-    // Store verification info fields as native C++ types
+    // Store verification info fields as native C++ types. Only populated when
+    // `dcEnabled` is true.
     std::string serviceName;
     uint32_t validTime;
     uint16_t expectedVerifyScheme;
@@ -43,6 +44,11 @@ struct FizzClientContext {
     std::string caCertPath;
     std::vector<std::string> alpnProtocols;
     std::string sniHostname;
+    /// False when the context was built via `new_client_tls_context_no_dc`,
+    /// i.e. the client is doing plain TLS without delegated credentials. The
+    /// connect/handshake paths branch on this to skip DC-specific behaviour
+    /// (factory, ClientHello extension, peer-cert verification cast).
+    bool dcEnabled{true};
 };
 
 // Forward declare types to avoid circular includes
@@ -79,11 +85,15 @@ struct FizzClientConnection : public folly::AsyncTransportWrapper::ReadCallback 
     std::string caCertPath; // Needed to create verifier during handshake
 
     /// Out-of-band expectations from [`VerificationInfo`] (copied from context at connect).
+    /// Only populated when `dcEnabled` is true.
     std::string expectedServiceName;
     uint32_t expectedValidTime{0};
     uint16_t expectedVerifyScheme{0};
     std::string expectedPublicKeyDerHex;
     uint64_t expectedExpiresAt{0};
+    /// Copied from the context at connect time. Branches the handshake
+    /// callback between DC verification and plain TLS verification.
+    bool dcEnabled{true};
 
     // Pending read data (owned by C++ to avoid Rust buffer lifetime issues)
     std::vector<uint8_t> pending_read_data;

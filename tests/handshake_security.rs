@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use fizz_rs::{
-    CertificatePublic, ClientTlsContext, DelegatedCredentialData, ServerTlsContext, VerificationInfo,
+    Certificate, CertificatePublic, ClientTlsContext, DelegatedCredentialData, ServerTlsContext,
+    VerificationInfo,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -95,6 +96,76 @@ async fn client_happy_path_roundtrip(
     let stream = tokio::net::TcpStream::connect(addr).await?;
     let client =
         ClientTlsContext::new(verification_info, ca_cert.to_str().expect("ca path utf-8"))?;
+    let mut conn = client.connect(stream, "localhost").await?;
+    conn.write_all(payload).await?;
+    conn.flush().await?;
+    Ok(())
+}
+
+async fn server_handshake_only_no_dc(
+    listener: TcpListener,
+    cert: Certificate,
+) -> Result<(), String> {
+    let (socket, _) = listener
+        .accept()
+        .await
+        .map_err(|e| format!("accept: {e}"))?;
+    let tls = ServerTlsContext::new_no_dc(cert)
+        .map_err(|e| format!("server ctx (no-dc): {e}"))?;
+    let _conn = tls
+        .accept_from_stream(socket)
+        .await
+        .map_err(|e| format!("server handshake (no-dc): {e}"))?;
+    Ok(())
+}
+
+async fn server_happy_path_roundtrip_no_dc(
+    listener: TcpListener,
+    cert: Certificate,
+    expected: &[u8],
+) -> Result<(), String> {
+    let (socket, _) = listener
+        .accept()
+        .await
+        .map_err(|e| format!("accept: {e}"))?;
+    let tls = ServerTlsContext::new_no_dc(cert)
+        .map_err(|e| format!("server ctx (no-dc): {e}"))?;
+    let mut conn = tls
+        .accept_from_stream(socket)
+        .await
+        .map_err(|e| format!("server handshake (no-dc): {e}"))?;
+
+    let mut buf = vec![0u8; expected.len()];
+    conn.read_exact(&mut buf)
+        .await
+        .map_err(|e| format!("read_exact: {e}"))?;
+    if buf.as_slice() != expected {
+        return Err(format!(
+            "payload mismatch: got {} bytes, expected {:?}",
+            buf.len(),
+            expected
+        ));
+    }
+    Ok(())
+}
+
+async fn client_handshake_only_no_dc(
+    addr: SocketAddr,
+    ca_cert: &PathBuf,
+) -> fizz_rs::Result<()> {
+    let stream = tokio::net::TcpStream::connect(addr).await?;
+    let client = ClientTlsContext::new_no_dc(ca_cert.to_str().expect("ca path utf-8"))?;
+    let _conn = client.connect(stream, "localhost").await?;
+    Ok(())
+}
+
+async fn client_happy_path_roundtrip_no_dc(
+    addr: SocketAddr,
+    ca_cert: &PathBuf,
+    payload: &[u8],
+) -> fizz_rs::Result<()> {
+    let stream = tokio::net::TcpStream::connect(addr).await?;
+    let client = ClientTlsContext::new_no_dc(ca_cert.to_str().expect("ca path utf-8"))?;
     let mut conn = client.connect(stream, "localhost").await?;
     conn.write_all(payload).await?;
     conn.flush().await?;
@@ -220,6 +291,89 @@ async fn handshake_fails_when_verification_info_does_not_match_server_delegated_
         client_res.is_err(),
         "client must not complete TLS when VerificationInfo does not match the server DC \
          (got {client_res:?}; server={server_res:?})"
+    );
+    let _ = server_res;
+}
+
+/// Non-DC happy path: server serves the parent certificate directly via
+/// [`ServerTlsContext::new_no_dc`]; client validates it via
+/// [`ClientTlsContext::new_no_dc`]. After handshake, the client sends a small
+/// payload that the server reads back. Mirrors
+/// [`delegated_tls_happy_path_handshake_and_round_trip`] for the no-DC code path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_tls_happy_path_handshake_and_round_trip_no_dc() {
+    let (cert, ca_path) =
+        common::load_no_dc_materials().expect("load no-dc fixtures");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let (started_tx, started_rx) = oneshot::channel();
+    let expected = HAPPY_PATH_PAYLOAD.to_vec();
+    let server = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        server_happy_path_roundtrip_no_dc(listener, cert, &expected).await
+    });
+    started_rx.await.expect("server started");
+
+    let client = tokio::spawn(async move {
+        client_happy_path_roundtrip_no_dc(addr, &ca_path, HAPPY_PATH_PAYLOAD).await
+    });
+
+    let outcome = timeout(HANDSHAKE_TEST_TIMEOUT, async move {
+        let c = client.await.expect("client join");
+        let s = server.await.expect("server join");
+        (c, s)
+    })
+    .await;
+
+    let (client_res, server_res) =
+        outcome.expect("no-dc happy-path test should finish (no hang)");
+    client_res.expect("client handshake and write (no-dc)");
+    server_res.expect("server handshake and read (no-dc)");
+}
+
+/// Non-DC client must still reject a server certificate not signed by a
+/// trusted CA: dropping the DC layer doesn't weaken the underlying TLS
+/// certificate verification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handshake_fails_when_ca_does_not_trust_server_certificate_no_dc() {
+    let (cert, _server_cert_path) =
+        common::load_no_dc_materials().expect("load no-dc fixtures");
+    let wrong_ca = common::wrong_ca_path();
+    assert!(
+        wrong_ca.is_file(),
+        "missing {}; generate with openssl req -x509 ...",
+        wrong_ca.display()
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let (started_tx, started_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        server_handshake_only_no_dc(listener, cert).await
+    });
+    started_rx.await.expect("server started");
+
+    let client =
+        tokio::spawn(async move { client_handshake_only_no_dc(addr, &wrong_ca).await });
+
+    let outcome = timeout(HANDSHAKE_TEST_TIMEOUT, async move {
+        let c = client.await.expect("client join");
+        let s = server.await.expect("server join");
+        (c, s)
+    })
+    .await;
+
+    let (client_res, server_res) =
+        outcome.expect("no-dc wrong-CA test should finish (no hang)");
+
+    assert!(
+        client_res.is_err(),
+        "expected client handshake to fail under no-dc: wrong CA must not trust the server \
+         certificate (got {client_res:?})"
     );
     let _ = server_res;
 }
