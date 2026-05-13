@@ -206,7 +206,28 @@ fn main() {
     println!("cargo:rustc-link-lib=pthread");
     // Apple Clang uses libc++ (`-lc++`); GNU toolchains typically use libstdc++ (`-lstdc++`).
     #[cfg(target_os = "macos")]
-    println!("cargo:rustc-link-lib=c++");
+    {
+        println!("cargo:rustc-link-lib=c++");
+        // Folly references newer libc++abi entry points (e.g.
+        // `__cxa_increment_exception_refcount`) that are not re-exported by
+        // libc++.dylib on every SDK; link libc++abi explicitly so the linker
+        // resolves them from the system stub.
+        println!("cargo:rustc-link-lib=c++abi");
+        // Rust on macOS defaults to a deployment target of 10.12/11.0
+        // depending on the host, which predates several libc++abi symbols
+        // folly uses. Bump it to 13.0 so those symbols are visible at link
+        // time. (Folly itself is built by getdeps against the host SDK.)
+        let macos_deployment_target = std::env::var("MACOSX_DEPLOYMENT_TARGET")
+            .unwrap_or_else(|_| "13.0".to_string());
+        println!(
+            "cargo:rustc-env=MACOSX_DEPLOYMENT_TARGET={}",
+            macos_deployment_target
+        );
+        println!(
+            "cargo::rustc-link-arg=-mmacosx-version-min={}",
+            macos_deployment_target
+        );
+    }
     #[cfg(not(target_os = "macos"))]
     println!("cargo:rustc-link-lib=stdc++");
     println!("cargo:rustc-link-lib=boost_context"); // Required by Folly
