@@ -211,14 +211,23 @@ void server_context_set_alpn_protocols(
 // Destructor for FizzServerConnection - ensures EventBase thread is cleaned up
 FizzServerConnection::~FizzServerConnection() {
     try {
-        // Stop EventBase thread if it's running
+        // Stop the loop and join before releasing anything its callbacks
+        // still reference.
         if (evb_thread && evb_thread->joinable()) {
             if (evb) {
                 evb->terminateLoopSoon();
             }
             evb_thread->join();
         }
-
+        // ~EventBase runs a final loop iteration to drain queued callbacks,
+        // and that drain can deliver readEOF/readErr, both of which wake
+        // `read_waker`. Release the EventBase here, while `read_waker` is
+        // still a live member, then release the waker. Leaving `evb` to
+        // implicit member destruction frees `read_waker` first — it is
+        // declared later in the struct, so destroyed earlier — and the
+        // drain then wakes through a dangling rust::Box.
+        evb.reset();
+        read_waker.reset();
     } catch (...) {
         // Swallow exceptions in destructor to avoid std::terminate
     }
@@ -258,13 +267,20 @@ void FizzServerConnection::readEOF() noexcept {
 
 void FizzServerConnection::readErr(const folly::AsyncSocketException& ex) noexcept {
     errorMessage = ex.what();
-    std::cerr << "Got error" << errorMessage << std::endl;
     if (pending_read) {
         pending_read = false;
         read_mutex.unlock();
     }
+    // `read_or_status` reports only bytes-read and EOF, so surface the error
+    // as end-of-stream: that is the terminal state `poll_read` acts on. The
+    // text stays in `errorMessage` for diagnostics.
+    readEof.store(true, std::memory_order_release);
     auto* transport_ = static_cast<fizz::server::AsyncFizzServer*>(transport);
     transport_->closeNow();
+    // Without this the Rust task stays Pending until its request timeout.
+    if (read_waker) {
+        wake_read_waker(**read_waker);
+    }
 }
 
 std::unique_ptr<FizzServerConnection> server_accept_connection(
