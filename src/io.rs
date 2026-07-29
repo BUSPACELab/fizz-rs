@@ -22,7 +22,16 @@ pub(crate) fn extract_raw_fd(stream: &TcpStream) -> RawFd {
 ///
 /// This consumes the TcpStream and returns its raw FD.
 /// The caller is responsible for managing the FD lifecycle.
+///
+/// Sets TCP_NODELAY before handing the FD to C++. Every connection here
+/// carries request/response traffic (TLS handshake flights, then RPC or
+/// HTTP exchanges), where Nagle's algorithm delays each small write that
+/// follows an unacknowledged one by up to a delayed-ACK interval (~40ms
+/// on Linux). The C++ side wraps the FD in a folly AsyncSocket without
+/// touching the option, and cpp_bench.cpp already sets it for the same
+/// reason.
 pub(crate) fn take_raw_fd(stream: TcpStream) -> RawFd {
+    let _ = stream.set_nodelay(true);
     // Convert TcpStream to std::net::TcpStream first
     stream.into_std()
         .expect("Failed to convert to std::net::TcpStream")
