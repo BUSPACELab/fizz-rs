@@ -5,3 +5,5 @@ To keep our submodule dependencies (primarily fizz) up to date and non-breaking 
 - **`fizz-homebrew-openssl.patch`** — `getdeps` assumed `openssl@1.1`; current Homebrew often only has `openssl@3`, which made `os.path.exists(None)` crash. Prefer `@3`, fall back to `@1.1`, guard `None`.
 
 - **`fizz-getdeps-pin-git-rev.patch`** — The Fizz manifest has no `[git] rev`, so getdeps clones **main** from GitHub while `build/deps/github_hashes/facebook/folly-rev.txt` pins an older Folly. That mismatch breaks the build (e.g. `AsyncSocketTransport::BindOptions`). The patch pins `[git] rev` to match the **current `third_party/fizz` submodule**; if you update the submodule, refresh this patch’s hash to match `git rev-parse HEAD` in `third_party/fizz`.
+
+- **`fizz-xz-use-system-package.patch`** — Upstream builds xz from source on Ubuntu (its package hangs watchman's tests, which we never build), downloading `xz-5.2.5.tar.gz` from tukaani.org — a host that times out from CI runners often enough to fail whole jobs even through retries. The patch lets every distro satisfy xz with the system package; CI installs `liblzma-dev` alongside the other system deps.

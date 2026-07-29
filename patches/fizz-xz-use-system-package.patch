@@ -1,0 +1,18 @@
+Upstream excludes ubuntu's liblzma-dev because it hangs watchman's
+tests. We never build watchman, and the exclusion forces getdeps to
+build xz from source, downloading xz-5.2.5.tar.gz from tukaani.org --
+a host that times out from CI runners often enough to fail whole jobs
+even through retries. Use the system package on every distro.
+
+--- a/build/fbcode_builder/manifests/xz
++++ b/build/fbcode_builder/manifests/xz
+@@ -1,8 +1,7 @@
+ [manifest]
+ name = xz
+ 
+-# ubuntu's package causes watchman's tests to hang
+-[debs.not(distro=ubuntu)]
++[debs]
+ liblzma-dev
+ 
+ [homebrew]

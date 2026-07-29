@@ -65,6 +65,17 @@ fn apply_fizz_patches(fizz_rs_directory: &str) {
         "fizz-getdeps-pin-git-rev.patch",
         pin_done,
     );
+
+    let xz_manifest_path =
+        format!("{fizz_rs_directory}/third_party/fizz/build/fbcode_builder/manifests/xz");
+    let xz_done = fs::read_to_string(&xz_manifest_path)
+        .map_or(false, |m| m.contains("[debs]\nliblzma-dev"));
+    apply_one_patch(
+        fizz_rs_directory,
+        &fizz_dir,
+        "fizz-xz-use-system-package.patch",
+        xz_done,
+    );
 }
 
 fn build_fizz() -> String {
