@@ -70,6 +70,21 @@ std::pair<ServerCredential, ClientVerificationInfo> generateDelegatedCredential(
   // Store the public key in DER format before moving anything
   std::string publicKeyDer = publicKeyToDer(credKey);
 
+  // Capture the rest of what a client needs while `credential` is still intact;
+  // it is moved into PEM serialization below. Expiry is derived from the parent
+  // certificate's notBefore plus valid_time, which is how the peer recomputes
+  // it, rather than from the local clock.
+  const uint32_t validTime = credential.valid_time;
+  const uint16_t verifyScheme =
+      static_cast<uint16_t>(credential.expected_verify_scheme);
+  const auto expiresTimePoint =
+      fizz::extensions::DelegatedCredentialUtils::getCredentialExpiresTime(
+          parentCert->getX509(), credential);
+  const uint64_t expiresAt = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          expiresTimePoint.time_since_epoch())
+          .count());
+
   // Convert private key to PEM format before moving
   folly::ssl::BioUniquePtr bio(BIO_new(BIO_s_mem()));
   if (!bio) {
@@ -94,9 +109,7 @@ std::pair<ServerCredential, ClientVerificationInfo> generateDelegatedCredential(
   // Create ServiceCredential structure
   return std::pair{
       ServerCredential{static_cast<uint16_t>(credSigScheme), credentialPEM},
-      ClientVerificationInfo{
-          static_cast<uint16_t>(credential.expected_verify_scheme),
-          publicKeyToDer(credKey)}};
+      ClientVerificationInfo{verifyScheme, publicKeyDer, validTime, expiresAt}};
 }
 
 }  // namespace sidecar
