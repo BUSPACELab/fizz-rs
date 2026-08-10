@@ -25,6 +25,10 @@ struct ServerCredential {
 struct ClientVerificationInfo {
   uint16_t verifyScheme;
   std::string publicKeyDer;
+  // A client compares both of these against the credential it is offered, so
+  // they have to be the credential's real values rather than placeholders.
+  uint32_t validTime;
+  uint64_t expiresAt;
 };
 
 // Generate a delegated credential.
