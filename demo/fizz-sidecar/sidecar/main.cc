@@ -45,13 +45,15 @@ int main(int argc, char* argv[]) {
   server_file << serverJson.dump(2) << std::endl;
   server_file.close();
 
-  // Serialize client.
+  // Serialize client. service_name stays empty because the peer ignores it;
+  // valid_time and expires_at must be the credential's real values, since the
+  // peer compares both against the credential it is offered.
   nlohmann::json clientJson = nlohmann::json::object(
       {{"service_name", ""},
-       {"valid_time", 0},
+       {"valid_time", clientVerificationInfo.validTime},
        {"expected_verify_scheme", clientVerificationInfo.verifyScheme},
        {"public_key_der", clientVerificationInfo.publicKeyDer},
-       {"expires_at", 0}});
+       {"expires_at", clientVerificationInfo.expiresAt}});
 
   std::ofstream client_file("/tmp/fizz_client.json");
   client_file << clientJson.dump(2) << std::endl;
