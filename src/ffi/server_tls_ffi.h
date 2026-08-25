@@ -76,6 +76,19 @@ struct FizzServerConnection : public folly::AsyncTransportWrapper::ReadCallback 
 
     /// Rust-owned waker slot. Fired from `readDataAvailable` / `readEOF` so
     /// that the Rust `poll_read` task can wake without spin-polling.
+    ///
+    /// Guarded by `waker_mutex`, and only ever touched through `wakeReader()`
+    /// and the destructor. Testing the optional and dereferencing it were
+    /// previously separate steps with nothing between them: a callback could
+    /// pass the test, the destructor could free the box, and the callback then
+    /// dereferenced freed memory. That is a null deref inside
+    /// `ReadWaker::wake`, seen as a SIGSEGV in a fizz callback delivering
+    /// application data.
+    ///
+    /// A separate mutex rather than `read_mutex`: that one is held from
+    /// `getReadBuffer` until the matching `readDataAvailable`, so reusing it
+    /// here would nest a lock inside its own critical section.
+    std::mutex waker_mutex;
     std::optional<rust::Box<ReadWaker>> read_waker;
 
     /// Set by the async write-completion callback on `writeErr`. Checked at

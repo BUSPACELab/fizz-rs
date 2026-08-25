@@ -137,12 +137,22 @@ FizzClientConnection::~FizzClientConnection() {
         // declared later in the struct, so destroyed earlier — and the
         // drain then wakes through a dangling rust::Box.
         evb.reset();
-        read_waker.reset();
+        {
+            std::lock_guard<std::mutex> guard(waker_mutex);
+            read_waker.reset();
+        }
     } catch (...) {
         // Swallow exceptions in destructor to avoid std::terminate
     }
 }
 
+
+void FizzClientConnection::wakeReader() noexcept {
+    std::lock_guard<std::mutex> guard(waker_mutex);
+    if (read_waker) {
+        wake_read_waker(**read_waker);
+    }
+}
 
 void FizzClientConnection::getReadBuffer(void** bufReturn, size_t* lenReturn) {
     // Held until the matched readDataAvailable / readEOF / readErr fires.
@@ -158,9 +168,7 @@ void FizzClientConnection::readDataAvailable(size_t len) noexcept {
     bytesRead += len;
     pending_read = false;
     read_mutex.unlock();
-    if (read_waker) {
-        wake_read_waker(**read_waker);
-    }
+    wakeReader();
 }
 
 void FizzClientConnection::readEOF() noexcept {
@@ -171,9 +179,7 @@ void FizzClientConnection::readEOF() noexcept {
     }
     auto* transport_ = static_cast<fizz::client::AsyncFizzClient*>(transport);
     transport_->closeNow();
-    if (read_waker) {
-        wake_read_waker(**read_waker);
-    }
+    wakeReader();
 }
 
 void FizzClientConnection::readErr(const folly::AsyncSocketException& ex) noexcept {
@@ -189,9 +195,7 @@ void FizzClientConnection::readErr(const folly::AsyncSocketException& ex) noexce
     auto* transport_ = static_cast<fizz::client::AsyncFizzClient*>(transport);
     transport_->closeNow();
     // Without this the Rust task stays Pending until its request timeout.
-    if (read_waker) {
-        wake_read_waker(**read_waker);
-    }
+    wakeReader();
 }
 
 // ============================================================================
@@ -833,6 +837,9 @@ size_t client_connection_write(
 void set_client_read_waker(
     FizzClientConnection& conn,
     rust::Box<ReadWaker> waker) {
+    // Under the same lock as the wake path: installing the waker races the evb
+    // thread's read callbacks, which run as soon as the handshake completes.
+    std::lock_guard<std::mutex> guard(conn.waker_mutex);
     conn.read_waker = std::move(waker);
 }
 
