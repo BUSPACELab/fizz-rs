@@ -70,6 +70,11 @@ struct FizzClientConnection : public folly::AsyncTransportWrapper::ReadCallback 
     void readEOF() noexcept override;
     void readErr(const folly::AsyncSocketException& ex) noexcept override;
 
+    /// Wake the Rust reader if a waker is installed. Takes `waker_mutex` so the
+    /// check and the wake cannot straddle a concurrent `reset()` in the
+    /// destructor — which is the use-after-free this replaces.
+    void wakeReader() noexcept;
+
     std::shared_ptr<folly::EventBase> evb;
     std::unique_ptr<std::thread> evb_thread; // Thread running EventBase loop
     void* transport; // AsyncFizzClient* (void* to avoid header dependency)
