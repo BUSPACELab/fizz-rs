@@ -103,11 +103,15 @@ std::unique_ptr<FizzServerContext> new_server_tls_context(
         }});
 
         // Configure supported groups
+        // x25519 first, matching fizz's own default key share. With
+        // secp256r1 first the server prefers a group the client sent no share
+        // for, so every handshake took a HelloRetryRequest: an extra round
+        // trip, then P-256.
         context->ctx->setSupportedGroups({{
+            fizz::NamedGroup::x25519,
             fizz::NamedGroup::secp256r1,
             fizz::NamedGroup::secp384r1,
-            fizz::NamedGroup::secp521r1,
-            fizz::NamedGroup::x25519
+            fizz::NamedGroup::secp521r1
         }});
 
         // Initialize ALPN protocols list (empty for now, can be set later)
@@ -171,11 +175,15 @@ std::unique_ptr<FizzServerContext> new_server_tls_context_no_dc(
             fizz::SignatureScheme::ecdsa_secp521r1_sha512,
             fizz::SignatureScheme::rsa_pss_sha256
         }});
+        // x25519 first, matching fizz's own default key share. With
+        // secp256r1 first the server prefers a group the client sent no share
+        // for, so every handshake took a HelloRetryRequest: an extra round
+        // trip, then P-256.
         context->ctx->setSupportedGroups({{
+            fizz::NamedGroup::x25519,
             fizz::NamedGroup::secp256r1,
             fizz::NamedGroup::secp384r1,
-            fizz::NamedGroup::secp521r1,
-            fizz::NamedGroup::x25519
+            fizz::NamedGroup::secp521r1
         }});
 
         context->alpnProtocols = {};
