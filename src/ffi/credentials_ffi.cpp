@@ -212,21 +212,23 @@ ServiceCredential generate_delegated_credential(
         std::string publicKeyDer = publicKeyToDerHex(credKey.get());
         std::string keyPEM = keyToPem(credKey.get());
 
+        // Read the fields the verification info carries before the credential
+        // is moved into the PEM. They must come from this one signing: a
+        // second credential could land in the next second, and its valid_time
+        // would then differ from the one served, failing every handshake.
+        auto pkData = credential.public_key->coalesce();
+        std::string pkHex = bytes_to_hex_lower(pkData);
+        auto sigData = credential.signature->coalesce();
+        std::string sigHex = bytes_to_hex_lower(sigData);
+        uint32_t validTime = credential.valid_time;
+        auto expectedVerifyScheme = credential.expected_verify_scheme;
+        auto credentialScheme = credential.credential_scheme;
+
         // Generate credential PEM
         std::string credentialPEM = fizz::extensions::generateDelegatedCredentialPEM(
             fizz::extensions::DelegatedCredentialMode::Server,
             std::move(credential),
             keyPEM);
-
-        // Re-generate credential for storage (since we moved it)
-        auto credential2 = fizz::extensions::DelegatedCredentialUtils::generateCredential(
-            generator.parentCert,
-            generator.parentKey,
-            credKey,
-            parentSigScheme,
-            credSigScheme,
-            fizz::CertificateVerifyContext::ServerDelegatedCredential,
-            std::chrono::seconds(valid_seconds));
 
         // Calculate timestamps
         auto now = std::chrono::system_clock::now();
@@ -236,21 +238,14 @@ ServiceCredential generate_delegated_credential(
         uint64_t expiresTimestamp = std::chrono::duration_cast<std::chrono::seconds>(
             expiresAt.time_since_epoch()).count();
 
-        // Serialize credential fields
-        auto pkData = credential2.public_key->coalesce();
-        std::string pkHex = bytes_to_hex_lower(pkData);
-
-        auto sigData = credential2.signature->coalesce();
-        std::string sigHex = bytes_to_hex_lower(sigData);
-
         // Build ServiceCredential
         ServiceCredential result;
         result.service_name = serviceName;
 
-        result.credential.valid_time = credential2.valid_time;
-        result.credential.expected_verify_scheme = static_cast<uint16_t>(credential2.expected_verify_scheme);
+        result.credential.valid_time = validTime;
+        result.credential.expected_verify_scheme = static_cast<uint16_t>(expectedVerifyScheme);
         result.credential.public_key_der = pkHex;
-        result.credential.credential_scheme = static_cast<uint16_t>(credential2.credential_scheme);
+        result.credential.credential_scheme = static_cast<uint16_t>(credentialScheme);
         result.credential.signature = sigHex;
 
         result.private_key_pem = keyPEM;
