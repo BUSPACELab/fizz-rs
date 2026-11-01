@@ -83,8 +83,15 @@ fn build_fizz() -> String {
     apply_fizz_patches(&fizz_rs_directory);
     let fizz_directory = format!("{fizz_rs_directory}/third_party/fizz");
 
-    let out_dir = std::env::var("OUT_DIR").unwrap();
-    let install_dir = format!("{out_dir}/fizz-install");
+    // FIZZ_RS_SCRATCH lets several target directories share one getdeps scratch
+    // path. getdeps is incremental, so only the first build compiles fizz and
+    // its dependencies; the rest find them built. Without it, each target
+    // directory (release, debug, a `cargo check` by a rustc plugin) builds its own.
+    println!("cargo:rerun-if-env-changed=FIZZ_RS_SCRATCH");
+    let install_dir = match std::env::var("FIZZ_RS_SCRATCH") {
+        Ok(dir) => dir,
+        Err(_) => format!("{}/fizz-install", std::env::var("OUT_DIR").unwrap()),
+    };
     println!("cargo:warning=Building and installing fizz into {install_dir}");
 
     let output_file = File::create("/tmp/fizz.log").expect("failed to create /tmp/fizz.log");
